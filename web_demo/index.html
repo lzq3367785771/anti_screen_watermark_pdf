@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="本地完成PDF水印嵌入，并对偷拍文档照片进行水印溯源。">
+  <title>文档水印工作台</title><link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div><div class="ambient ambient-two" aria-hidden="true"></div>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="返回文档水印工作台首页"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M8 4h11l5 5v19H8z"></path><path d="M19 4v6h6M12 15h8M12 19h8"></path><circle cx="21.5" cy="22.5" r="4.5"></circle><path d="m25 26 3 3"></path></svg></span><span><strong>文档水印工作台</strong><small>Document Watermark Console</small></span></a>
+    <div class="service-state" id="serviceState" data-state="checking"><span class="state-dot"></span><span id="serviceText">正在连接本地服务</span></div>
+  </header>
+  <main class="page-shell">
+    <section class="hero"><div class="version-pill"><span>LOCAL DEMO</span><b>V2.0A.2</b></div><h1>给文档加入专属编号，<br><span>也能从偷拍照片追溯来源</span></h1><p>上传 PDF 即可生成带水印文件；上传拍摄照片即可查找水印号码。处理和注册信息全部保留在本机。</p></section>
+    <nav class="mode-tabs" aria-label="选择功能">
+      <button id="embedModeButton" class="mode-tab is-active" type="button"><span>01</span><strong>嵌入水印</strong><small>PDF → 带水印PDF</small></button>
+      <button id="traceModeButton" class="mode-tab" type="button"><span>02</span><strong>照片溯源</strong><small>偷拍照片 → 水印号码</small></button>
+      <button id="manageModeButton" class="mode-tab" type="button"><span>03</span><strong>水印管理</strong><small>查看、下载或删除</small></button>
+    </nav>
+    <section class="workspace" aria-label="文档水印工作区">
+      <div class="trace-card">
+        <section id="embedPanel">
+          <div class="card-heading"><div><span class="step-label">ISSUE WATERMARK</span><h2>生成带水印 PDF</h2></div><span class="format-note">PDF · 最大100 MB</span></div>
+          <label class="number-field" for="watermarkNumber"><span>水印号码</span><input id="watermarkNumber" type="text" maxlength="32" autocomplete="off" spellcheck="false" placeholder="例如：WM-2026-0001"><small>3～32位，可使用字母、数字、短横线和下划线；号码不可重复。</small></label>
+          <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden>
+          <button class="drop-zone pdf-drop-zone" id="pdfDropZone" type="button"><span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M12 5h16l8 8v30H12z"></path><path d="M28 5v9h9M17 29h14M17 34h10"></path></svg></span><strong>拖拽 PDF 到这里</strong><span>或点击选择需要发行的原始文档</span><em>系统会逐页嵌入水印并生成新的 PDF</em></button>
+          <div class="pdf-summary" id="pdfPreviewPanel" hidden><span class="pdf-badge">PDF</span><div><strong id="pdfFileName"></strong><small id="pdfFileMeta"></small></div><button id="removePdf" type="button" aria-label="移除PDF">×</button></div>
+          <div class="upload-error" id="embedError" role="alert" hidden></div>
+          <button class="primary-action" id="embedButton" type="button" disabled><span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-5-5m5 5 5-5"></path><path d="M5 20h14"></path></svg></span><span>嵌入水印并生成 PDF</span><span class="button-arrow">→</span></button>
+          <div class="privacy-line"><svg viewBox="0 0 24 24"><path d="M7 10V8a5 5 0 0 1 10 0v2"></path><rect x="4" y="10" width="16" height="11" rx="3"></rect></svg><span>原始PDF、参考页和输出文件仅保存在本机运行目录</span></div>
+        </section>
+        <section id="tracePanel" hidden>
+          <div class="card-heading"><div><span class="step-label">TRACE WATERMARK</span><h2>上传偷拍文档照片</h2></div><span class="format-note">JPG · JPEG · PNG</span></div>
+          <input id="fileInput" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden>
+          <button class="drop-zone" id="dropZone" type="button"><span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 48 48"><rect x="5" y="8" width="38" height="32" rx="8"></rect><path d="M24 31V17m0 0-6 6m6-6 6 6"></path></svg></span><strong>拖拽照片到这里</strong><span>或点击选择手机拍摄的文档照片</span><em>单张不超过30 MB，推荐手机原始JPG</em></button>
+          <div class="preview-panel" id="previewPanel" hidden><div class="preview-frame"><img id="previewImage" alt="待溯源图片预览"><button class="remove-file" id="removeFile" type="button" aria-label="移除当前图片">×</button></div><div class="file-summary"><div><strong id="fileName"></strong><span id="fileMeta"></span></div><span class="ready-chip">准备就绪</span></div></div>
+          <div class="upload-error" id="uploadError" role="alert" hidden></div>
+          <button class="primary-action" id="traceButton" type="button" disabled><span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"></circle><path d="m16 16 4 4"></path></svg></span><span>开始文档溯源</span><span class="button-arrow">→</span></button>
+          <div class="privacy-line"><svg viewBox="0 0 24 24"><path d="M7 10V8a5 5 0 0 1 10 0v2"></path><rect x="4" y="10" width="16" height="11" rx="3"></rect></svg><span>默认处理后删除上传原图，不会发送到互联网</span></div>
+        </section>
+        <section id="managePanel" hidden>
+          <div class="card-heading"><div><span class="step-label">WATERMARK LIBRARY</span><h2>已发行水印文档</h2></div><button class="refresh-action" id="refreshLibrary" type="button">刷新列表</button></div>
+          <p class="manage-intro">按原始文档查看全部可用水印版本。删除后该版本将停止参与溯源，并移入本机回收目录。</p>
+          <div class="library-state" id="libraryState">正在读取水印记录……</div>
+          <div class="document-library" id="documentLibrary"></div>
+        </section>
+      </div>
+      <aside class="process-card" id="processCard" aria-label="处理流程">
+        <div class="card-heading compact"><div><span class="step-label">PROCESS</span><h2 id="processHeading">自动发行流程</h2></div></div>
+        <ol class="process-list" id="processList"><li data-process-step="0"><span class="process-index">01</span><div><strong></strong><small></small></div><i></i></li><li data-process-step="1"><span class="process-index">02</span><div><strong></strong><small></small></div><i></i></li><li data-process-step="2"><span class="process-index">03</span><div><strong></strong><small></small></div><i></i></li><li data-process-step="3"><span class="process-index">04</span><div><strong></strong><small></small></div><i></i></li></ol>
+        <div class="time-estimate"><span class="time-icon">◷</span><div><strong id="estimateTitle">预计1～3分钟</strong><small id="estimateText">页数越多，逐页渲染和嵌入耗时越长</small></div></div>
+      </aside>
+    </section>
+    <section class="processing-card" id="processingCard" aria-live="polite" hidden><div class="scanner-visual" aria-hidden="true"><div class="document-shape"><span></span><span></span><span></span><span></span></div><div class="scan-line"></div></div><div><span class="step-label" id="processingLabel">PROCESSING</span><h2 id="processingTitle"></h2><p id="processingDescription">请保持当前页面开启，不要重复提交。</p></div><span class="elapsed-time" id="elapsedTime">00:00</span></section>
+    <section class="result-card" id="resultCard" aria-live="polite" hidden>
+      <div class="result-header"><span class="result-icon" id="resultIcon"></span><div><span class="step-label" id="resultLabel"></span><h2 id="resultTitle"></h2><p id="resultDescription"></p></div></div>
+      <div class="success-details" id="successDetails" hidden><div class="detail-block"><span id="primaryResultLabel">水印号码</span><div class="copy-value"><code id="primaryResultValue"></code><button id="copyPrimary" type="button">复制</button></div></div><div class="detail-grid"><div><span id="detailOneLabel"></span><strong id="detailOneValue"></strong></div><div><span id="detailTwoLabel"></span><strong id="detailTwoValue"></strong></div><div><span id="detailThreeLabel"></span><strong id="detailThreeValue"></strong></div><div><span>处理耗时</span><strong id="elapsedValue"></strong></div></div></div>
+      <div class="suggestion-panel" id="suggestionPanel" hidden><strong>建议重新操作时：</strong><ul id="suggestionList"></ul></div>
+      <details class="technical-details" id="technicalDetails"><summary>查看技术详情 <span>展开</span></summary><div class="technical-grid" id="technicalGrid"></div></details>
+      <div class="result-actions"><a class="preview-action" id="previewButton" target="_blank" rel="noopener" hidden>在线查看 PDF</a><a class="download-action" id="downloadButton" hidden>下载带水印 PDF</a><button class="secondary-action" id="retryButton" type="button">继续操作</button></div>
+    </section>
+  </main>
+  <footer><span>Anti-Screen Watermark · Local Demo</span><span>PDF发行 + V2.0A.2 局部分区溯源</span></footer>
+  <script src="/app.js" defer></script>
+</body></html>
