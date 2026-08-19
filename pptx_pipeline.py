@@ -254,6 +254,10 @@ def embed_document_pptx(
 
         pilot_alpha=pilot_alpha,
 
+        payload_flat_bright_scale=0.75,
+        
+        pilot_flat_bright_scale=0.60,
+
         recipient=recipient,
 
         session=session,
