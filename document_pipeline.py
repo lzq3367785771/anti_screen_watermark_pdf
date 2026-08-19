@@ -17,7 +17,7 @@ from pathlib import Path
 
 from document_registry import infer_source_type
 from pdf_pipeline import DEFAULT_KEY, embed_document_pdf
-
+from pptx_pipeline import embed_document_pptx
 
 DOCUMENT_PIPELINE_VERSION = "v2.1.0"
 
@@ -30,6 +30,7 @@ SUPPORTED_SOURCE_TYPES = {
 
 IMPLEMENTED_EMBED_TYPES = {
     "pdf",
+    "pptx",
 }
 
 
@@ -123,6 +124,49 @@ def embed_document(
             source_name=source_name,
         )
 
+
+    # --------------------------------------------------------
+    # PPTX Adapter
+    # --------------------------------------------------------
+
+    if resolved_type == "pptx":
+
+        return embed_document_pptx(
+            input_pptx=input_path,
+
+            registry_path=registry_path,
+
+            key=key,
+
+            output_pptx=output_path,
+
+            assets_root=assets_root,
+
+            dpi=dpi,
+
+            alpha=alpha,
+
+            repeat=repeat,
+
+            pilot_bits=pilot_bits,
+
+            pilot_repeat=pilot_repeat,
+
+            pilot_alpha=pilot_alpha,
+
+            recipient=recipient,
+
+            session=session,
+
+            notes=notes,
+
+            trace_token=trace_token,
+
+            watermark_number=
+                watermark_number,
+
+            source_name=source_name,
+        )
     # --------------------------------------------------------
     # Office Adapter
     #

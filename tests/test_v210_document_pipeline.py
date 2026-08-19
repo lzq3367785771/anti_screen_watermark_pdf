@@ -247,16 +247,18 @@ class DocumentPipelineTests(unittest.TestCase):
             )
 
 
-    def test_office_document_is_recognized_but_not_implemented(self):
+    def test_docx_is_recognized_but_not_implemented(self):
 
         with tempfile.TemporaryDirectory() as temporary:
 
             root = Path(temporary)
 
-            source = root / "meeting.pptx"
+            # PPTX 从 V2.1.1 开始已经真正实现，
+            # 所以这里改用尚未实现的 DOCX 测试。
+            source = root / "document.docx"
 
             source.write_bytes(
-                b"dummy-pptx-v210-test"
+                b"dummy-docx-v210-test"
             )
 
             registry_path = (
@@ -265,7 +267,7 @@ class DocumentPipelineTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 NotImplementedError,
-                "PPTX",
+                "DOCX",
             ):
 
                 embed_document(
