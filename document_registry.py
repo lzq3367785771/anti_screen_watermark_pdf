@@ -1,4 +1,9 @@
-"""Document-oriented TraceToken registry for the PDF V2.0A pipeline."""
+"""Document-oriented TraceToken registry.
+
+The registry is format-agnostic: PDF, DOCX, PPTX and XLSX documents can share
+the same document / issue / TraceToken model after they are rendered into
+reference page images.
+"""
 
 from __future__ import annotations
 
@@ -180,38 +185,185 @@ def derive_page_key(base_key, document_id, page_index, purpose="payload"):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+SOURCE_TYPE_ALIASES = {
+    "pdf": "pdf",
+    ".pdf": "pdf",
+
+    "docx": "docx",
+    ".docx": "docx",
+    "word": "docx",
+
+    "pptx": "pptx",
+    ".pptx": "pptx",
+    "powerpoint": "pptx",
+
+    "xlsx": "xlsx",
+    ".xlsx": "xlsx",
+    "excel": "xlsx",
+}
+
+
+DEFAULT_RENDER_UNIT_TYPES = {
+    "pdf": "page",
+    "docx": "page",
+    "pptx": "slide",
+    "xlsx": "sheet_page",
+}
+
+
+def normalize_source_type(source_type):
+    """把用户或适配器提供的文件类型统一为内部格式名。"""
+
+    if source_type is None:
+        return None
+
+    value = str(source_type).strip().lower()
+
+    if not value:
+        return None
+
+    return SOURCE_TYPE_ALIASES.get(value, value.lstrip("."))
+
+
+def infer_source_type(source_path, source_type=None):
+    """优先使用显式类型，否则根据源文件扩展名自动判断。"""
+
+    explicit = normalize_source_type(source_type)
+
+    if explicit:
+        return explicit
+
+    suffix = Path(source_path).suffix.lower()
+
+    inferred = normalize_source_type(suffix)
+
+    return inferred or "unknown"
+
+
+def default_render_unit_type(source_type):
+    """返回不同文档格式在渲染层中的基本二维单元。"""
+
+    normalized = normalize_source_type(source_type) or "unknown"
+
+    return DEFAULT_RENDER_UNIT_TYPES.get(
+        normalized,
+        "page",
+    )
+
+
+
+
+
+
 def register_document(
     registry_path,
-    source_pdf,
+    source_path,
     page_records,
     dpi,
     media_box_points,
     assets_dir,
     source_name=None,
+    source_type=None,
+    render_unit_type=None,
 ):
-    source_pdf = Path(source_pdf).resolve()
-    document_sha256 = sha256_file(source_pdf)
+    """登记一个可被渲染为二维页面单元的源文档。
+
+    当前保持 ``pages`` / ``page_index`` 字段兼容现有 PDF 溯源代码，
+    同时新增 source_type 和 unit_type，为 DOCX / PPTX / XLSX 适配做准备。
+    """
+
+    source_path = Path(source_path).resolve()
+
+    document_sha256 = sha256_file(source_path)
+
     document_id = document_sha256[:24]
+
+    resolved_source_type = infer_source_type(
+        source_path,
+        source_type=source_type,
+    )
+
+    resolved_unit_type = (
+        str(render_unit_type).strip().lower()
+        if render_unit_type is not None
+        else default_render_unit_type(resolved_source_type)
+    )
+
+    normalized_pages = []
+
+    for index, page_record in enumerate(page_records, start=1):
+
+        page = dict(page_record)
+
+        page.setdefault(
+            "page_index",
+            index,
+        )
+
+        page.setdefault(
+            "unit_type",
+            resolved_unit_type,
+        )
+
+        normalized_pages.append(page)
+
     registry = load_document_registry(registry_path)
-    existing = registry["documents"].get(document_id, {})
+
+    existing = registry["documents"].get(
+        document_id,
+        {},
+    )
+
     record = {
         **existing,
+
         "document_id": document_id,
+
         "document_sha256": document_sha256,
-        "source_name": str(source_name or source_pdf.name),
-        "source_path": str(source_pdf),
-        "page_count": len(page_records),
+
+        "source_name": str(
+            source_name or source_path.name
+        ),
+
+        "source_path": str(source_path),
+
+        "source_type": resolved_source_type,
+
+        "source_extension": source_path.suffix.lower(),
+
+        "render_unit_type": resolved_unit_type,
+
+        "page_count": len(normalized_pages),
+
         "dpi": int(dpi),
-        "media_box_points": [float(media_box_points[0]), float(media_box_points[1])],
-        "assets_dir": str(Path(assets_dir).resolve()),
-        "pages": list(page_records),
+
+        "media_box_points": [
+            float(media_box_points[0]),
+            float(media_box_points[1]),
+        ],
+
+        "assets_dir": str(
+            Path(assets_dir).resolve()
+        ),
+
+        "pages": normalized_pages,
+
         "status": "active",
     }
-    record.setdefault("registered_at", _now_iso())
-    registry["documents"][document_id] = record
-    save_document_registry(registry_path, registry)
-    return document_id, record
 
+    record.setdefault(
+        "registered_at",
+        _now_iso(),
+    )
+
+    registry["documents"][document_id] = record
+
+    save_document_registry(
+        registry_path,
+        registry,
+    )
+
+    return document_id, record
 
 def issue_document_trace(
     registry_path,
@@ -261,17 +413,60 @@ def issue_document_trace(
     return record
 
 
-def attach_issue_artifact(registry_path, trace_token, output_pdf, manifest_path):
+def attach_issue_artifact(
+    registry_path,
+    trace_token,
+    output_path,
+    manifest_path,
+):
+    """把一个已发行水印对应的实际输出文件挂到注册记录上。"""
+
     token = normalize_trace_token(trace_token)
+
     registry = load_document_registry(registry_path)
+
     if token not in registry["issues"]:
-        raise KeyError(f"TraceToken未登记: {token}")
-    registry["issues"][token].update({
-        "output_pdf": str(Path(output_pdf).resolve()),
-        "output_sha256": sha256_file(output_pdf),
-        "manifest_path": str(Path(manifest_path).resolve()),
-    })
-    save_document_registry(registry_path, registry)
+        raise KeyError(
+            f"TraceToken未登记: {token}"
+        )
+
+    output_path = Path(output_path).resolve()
+
+    artifact_type = (
+        output_path.suffix.lower().lstrip(".")
+        or "unknown"
+    )
+
+    artifact_record = {
+        "output_path": str(output_path),
+
+        "output_sha256": sha256_file(output_path),
+
+        "output_type": artifact_type,
+
+        "manifest_path": str(
+            Path(manifest_path).resolve()
+        ),
+    }
+
+    # 保留旧PDF字段。
+    #
+    # 当前Web Demo仍通过 issue["output_pdf"] 读取文件，
+    # 因此V2.1.0暂时不能删除这个字段。
+    if artifact_type == "pdf":
+        artifact_record["output_pdf"] = str(
+            output_path
+        )
+
+    registry["issues"][token].update(
+        artifact_record
+    )
+
+    save_document_registry(
+        registry_path,
+        registry,
+    )
+
     return registry["issues"][token]
 
 
