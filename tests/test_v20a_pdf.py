@@ -16,6 +16,8 @@ from document_registry import (
     register_document,
     retire_document_issue,
     score_registered_tokens,
+    infer_source_type,
+    default_render_unit_type,
 )
 from pdf_pipeline import (
     _manifest_for_document,
@@ -29,6 +31,135 @@ from watermark import extract_watermark_with_erasure
 
 
 class DocumentRegistryTests(unittest.TestCase):
+    def test_document_source_type_inference(self):
+
+        self.assertEqual(
+            infer_source_type("example.pdf"),
+            "pdf",
+        )
+
+        self.assertEqual(
+            infer_source_type("example.docx"),
+            "docx",
+        )
+
+        self.assertEqual(
+            infer_source_type("example.pptx"),
+            "pptx",
+        )
+
+        self.assertEqual(
+            infer_source_type("example.xlsx"),
+            "xlsx",
+        )
+
+        self.assertEqual(
+            infer_source_type(
+                "example.bin",
+                source_type="word",
+            ),
+            "docx",
+        )
+
+        self.assertEqual(
+            default_render_unit_type("pdf"),
+            "page",
+        )
+
+        self.assertEqual(
+            default_render_unit_type("docx"),
+            "page",
+        )
+
+        self.assertEqual(
+            default_render_unit_type("pptx"),
+            "slide",
+        )
+
+        self.assertEqual(
+            default_render_unit_type("xlsx"),
+            "sheet_page",
+        )
+    
+    
+    
+    def test_register_office_document_metadata(self):
+
+        with tempfile.TemporaryDirectory() as temporary:
+
+            root = Path(temporary)
+
+            source = root / "meeting.pptx"
+
+            # 这里只测试注册库，不解析真正PPTX。
+            source.write_bytes(
+                b"dummy-pptx-registry-test"
+            )
+
+            reference = root / "slide_001.png"
+
+            cv2.imwrite(
+                str(reference),
+                np.full(
+                    (720, 1280, 3),
+                    255,
+                    np.uint8,
+                ),
+            )
+
+            registry_path = root / "registry.json"
+
+            document_id, document = register_document(
+                registry_path,
+
+                source,
+
+                [{
+                    "page_index": 1,
+                    "width": 1280,
+                    "height": 720,
+                    "reference_path": str(reference),
+                    "reference_sha256": "test",
+                }],
+
+                96,
+
+                [960, 540],
+
+                root,
+            )
+
+            self.assertTrue(document_id)
+
+            self.assertEqual(
+                document["source_type"],
+                "pptx",
+            )
+
+            self.assertEqual(
+                document["source_extension"],
+                ".pptx",
+            )
+
+            self.assertEqual(
+                document["render_unit_type"],
+                "slide",
+            )
+
+            self.assertEqual(
+                document["pages"][0]["unit_type"],
+                "slide",
+            )
+
+            self.assertEqual(
+                document["pages"][0]["page_index"],
+                1,
+            )
+
+
+
+
+
     def test_user_watermark_number_is_normalized_and_unique(self):
         self.assertEqual(normalize_watermark_number(" wm-2026-001 "), "WM-2026-001")
         with self.assertRaises(ValueError):
