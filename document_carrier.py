@@ -36,14 +36,16 @@ from watermark import (
 )
 
 
-def _adaptive_alpha(block, base_alpha):
-    """根据局部页面纹理调整DCT嵌入强度。"""
-
+def _adaptive_alpha(
+    block,
+    base_alpha,
+    flat_bright_scale=0.60,
+):
     mean = float(np.mean(block))
     deviation = float(np.std(block))
 
     if mean >= 247.0 and deviation <= 2.5:
-        scale = 0.60
+        scale = float(flat_bright_scale)
 
     elif deviation < 7.0:
         scale = 0.78
@@ -68,6 +70,7 @@ def embed_bits_adaptive(
     repeat,
     block_size=8,
     position_offset=0,
+    flat_bright_scale=0.60,
 ):
     """在渲染页面中自适应嵌入一组bit。
 
@@ -127,6 +130,8 @@ def embed_bits_adaptive(
             local_alpha = _adaptive_alpha(
                 block,
                 alpha,
+                flat_bright_scale=
+                    flat_bright_scale,
             )
 
             alpha_values.append(
@@ -177,6 +182,8 @@ def issue_watermarked_pages(
     pilot_bits=64,
     pilot_repeat=6,
     pilot_alpha=78.0,
+    payload_flat_bright_scale=0.60,
+    pilot_flat_bright_scale=0.60,
     recipient=None,
     session=None,
     notes=None,
@@ -349,6 +356,8 @@ def issue_watermarked_pages(
                 repeat=repeat,
                 block_size=8,
                 position_offset=0,
+                flat_bright_scale=
+                    payload_flat_bright_scale,
             )
         )
 
@@ -373,6 +382,8 @@ def issue_watermarked_pages(
                     DOCUMENT_CODEWORD_BITS
                     * int(repeat)
                 ),
+                flat_bright_scale=
+                    pilot_flat_bright_scale,
             )
         )
 
