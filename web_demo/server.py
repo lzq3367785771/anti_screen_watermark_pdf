@@ -38,6 +38,7 @@ from document_registry import (  # noqa: E402
     normalize_watermark_number,
     retire_document_issue,
 )
+from document_pipeline import embed_document  # noqa: E402
 from pdf_pipeline import (  # noqa: E402
     DEFAULT_KEY,
     embed_document_pdf,
@@ -49,6 +50,29 @@ ALLOWED_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
     "image/png": ".png",
+}
+
+DOCUMENT_TYPES_BY_SUFFIX = {
+    ".pdf": "pdf",
+    ".pptx": "pptx",
+}
+
+DOCUMENT_CONTENT_TYPES = {
+    ".pdf": {
+        "application/pdf",
+        "application/octet-stream",
+    },
+    ".pptx": {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/octet-stream",
+    },
+}
+
+ARTIFACT_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".pptx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
 }
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -206,45 +230,102 @@ def build_watermark_catalog(registry):
 
     groups = {}
     deleted_count = 0
+
     for token, issue in registry.get("issues", {}).items():
         if issue.get("status", "issued") != "issued":
             deleted_count += 1
             continue
+
         document_id = issue.get("document_id")
         document = registry.get("documents", {}).get(document_id, {})
-        output_path = Path(issue.get("output_pdf", "")) if issue.get("output_pdf") else None
+
+        # V2.1+: Office/PDF 通用发行物路径。
+        # 新记录优先使用 output_path；
+        # 老 PDF 注册记录继续兼容 output_pdf。
+        output_value = issue.get("output_path") or issue.get("output_pdf")
+        output_path = Path(output_value) if output_value else None
         artifact_ready = bool(output_path and output_path.is_file())
-        group = groups.setdefault(document_id, {
-            "document_id": document_id,
-            "source_name": document.get("source_name") or "未命名文档.pdf",
-            "page_count": document.get("page_count"),
-            "watermarks": [],
-        })
-        group["watermarks"].append({
-            "id": token,
-            "watermark_number": issue.get("watermark_number"),
-            "issued_at": issue.get("issued_at"),
-            "file_name": output_path.name if output_path else None,
-            "output_available": artifact_ready,
-            "preview_url": f"/api/watermarks/{token}/preview" if artifact_ready else None,
-            "download_url": f"/api/watermarks/{token}/download" if artifact_ready else None,
-        })
+
+        # 判断最终发行文件类型。
+        # 优先相信实际文件扩展名，再兼容注册库中的 output_type。
+        artifact_suffix = output_path.suffix.lower() if output_path else ""
+        artifact_type = (
+            artifact_suffix.lstrip(".")
+            or str(issue.get("output_type") or "").lower().lstrip(".")
+            or str(document.get("source_type") or "").lower().lstrip(".")
+            or "unknown"
+        )
+
+        # 判断源文档类型。
+        source_name = document.get("source_name") or "未命名文档"
+        source_suffix = Path(source_name).suffix.lower().lstrip(".")
+        source_type = (
+            str(document.get("source_type") or "").lower().lstrip(".")
+            or source_suffix
+            or "pdf"
+        )
+
+        # 当前 Web 预览机制只支持 PDF。
+        # PPTX 可以下载，但不能交给浏览器 iframe 当 PDF 预览。
+        can_preview = artifact_ready and artifact_type == "pdf"
+
+        group = groups.setdefault(
+            document_id,
+            {
+                "document_id": document_id,
+                "source_name": source_name,
+                "source_type": source_type,
+                "render_unit_type": document.get("render_unit_type"),
+                "page_count": document.get("page_count"),
+                "watermarks": [],
+            },
+        )
+
+        group["watermarks"].append(
+            {
+                "id": token,
+                "watermark_number": issue.get("watermark_number"),
+                "issued_at": issue.get("issued_at"),
+                "file_name": output_path.name if output_path else None,
+                "output_type": artifact_type,
+                "output_available": artifact_ready,
+                "preview_url": (
+                    f"/api/watermarks/{token}/preview"
+                    if can_preview
+                    else None
+                ),
+                "download_url": (
+                    f"/api/watermarks/{token}/download"
+                    if artifact_ready
+                    else None
+                ),
+            }
+        )
+
     documents = list(groups.values())
+
     for document in documents:
         document["watermarks"].sort(
-            key=lambda item: item.get("issued_at") or "", reverse=True
+            key=lambda item: item.get("issued_at") or "",
+            reverse=True,
         )
         document["watermark_count"] = len(document["watermarks"])
+
     documents.sort(
         key=lambda item: (
-            item["watermarks"][0].get("issued_at") if item["watermarks"] else ""
+            item["watermarks"][0].get("issued_at")
+            if item["watermarks"]
+            else ""
         ),
         reverse=True,
     )
+
     return {
         "documents": documents,
         "document_count": len(documents),
-        "watermark_count": sum(item["watermark_count"] for item in documents),
+        "watermark_count": sum(
+            item["watermark_count"] for item in documents
+        ),
         "deleted_count": deleted_count,
     }
 
@@ -314,8 +395,9 @@ def make_request_handler(config):
                 and route_parts[:2] == ["api", "watermarks"]
                 and route_parts[3] in {"preview", "download"}
             ):
-                self._send_registered_pdf(
-                    route_parts[2], download=route_parts[3] == "download"
+                self._send_registered_artifact(
+                    route_parts[2],
+                    download=route_parts[3] == "download",
                 )
                 return
             if route.startswith("/api/download/"):
@@ -327,31 +409,129 @@ def make_request_handler(config):
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "页面不存在"})
 
-        def _send_registered_pdf(self, encoded_token, download=False):
+        def _send_registered_artifact(
+            self,
+            encoded_token,
+            download=False,
+        ):
             try:
-                token = normalize_trace_token(urllib.parse.unquote(encoded_token))
+                token = normalize_trace_token(
+                    urllib.parse.unquote(encoded_token)
+                )
             except (TypeError, ValueError):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "水印记录编号无效"})
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "水印记录编号无效"},
+                )
                 return
+
             with config.trace_lock:
-                registry = load_document_registry(config.registry_path)
-                issue = registry.get("issues", {}).get(token)
-                if issue is None or issue.get("status", "issued") != "issued":
-                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "水印记录不存在"})
+                registry = load_document_registry(
+                    config.registry_path
+                )
+
+                issue = registry.get(
+                    "issues",
+                    {},
+                ).get(token)
+
+                if (
+                    issue is None
+                    or issue.get(
+                        "status",
+                        "issued",
+                    )
+                    != "issued"
+                ):
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "水印记录不存在"},
+                    )
                     return
-                path = Path(issue.get("output_pdf", ""))
-                if not path.is_file() or path.suffix.lower() != ".pdf":
-                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "水印PDF文件不存在"})
+
+                # V2.1+ 通用发行物路径。
+                # 新记录优先使用 output_path，
+                # 老 PDF 继续兼容 output_pdf。
+                output_value = (
+                    issue.get("output_path")
+                    or issue.get("output_pdf")
+                )
+
+                if not output_value:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "水印文件路径不存在"},
+                    )
                     return
+
+                path = Path(output_value)
+
+                if not path.is_file():
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "水印文件不存在"},
+                    )
+                    return
+
+                suffix = path.suffix.lower()
+
+                content_type = ARTIFACT_CONTENT_TYPES.get(
+                    suffix
+                )
+
+                if content_type is None:
+                    self._send_json(
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                        {
+                            "error":
+                                f"暂不支持下载该文件类型: {suffix}"
+                        },
+                    )
+                    return
+
+                # 当前浏览器内预览只支持 PDF。
+                if (
+                    not download
+                    and suffix != ".pdf"
+                ):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error":
+                                "当前仅支持 PDF 在线预览，Office 文档请下载后打开"
+                        },
+                    )
+                    return
+
                 body = path.read_bytes()
-            self.send_response(HTTPStatus.OK)
-            self._common_headers("application/pdf", len(body))
-            quoted = urllib.parse.quote(path.name)
-            disposition = "attachment" if download else "inline"
+
+            self.send_response(
+                HTTPStatus.OK
+            )
+
+            self._common_headers(
+                content_type,
+                len(body),
+            )
+
+            quoted = urllib.parse.quote(
+                path.name
+            )
+
+            disposition = (
+                "attachment"
+                if download
+                else "inline"
+            )
+
             self.send_header(
                 "Content-Disposition",
-                f"{disposition}; filename*=UTF-8''{quoted}",
+                (
+                    f"{disposition}; "
+                    f"filename*=UTF-8''{quoted}"
+                ),
             )
+
             self.end_headers()
             self.wfile.write(body)
 
@@ -411,34 +591,203 @@ def make_request_handler(config):
             return upload_path, {"width": width, "height": height, "bytes": length}
 
         def _receive_pdf(self, request_id):
+            """
+            Receive a supported source document.
+
+            NOTE:
+            The method name is temporarily kept as _receive_pdf for backward
+            compatibility with the current _handle_embed(). It will be renamed
+            to _receive_document() when the embed handler is generalized.
+            """
+
+            import io
+            import zipfile
+
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError as error:
-                raise UploadError("文件长度无效") from error
-            if length <= 0:
-                raise UploadError("没有收到PDF文件")
-            if length > int(config.max_pdf_upload_bytes):
-                raise UploadError(
-                    "PDF超过上传大小限制", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+                length = int(
+                    self.headers.get(
+                        "Content-Length",
+                        "0",
+                    )
                 )
-            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
-            if content_type != "application/pdf":
-                raise UploadError("仅支持PDF文件")
-            body = self.rfile.read(length)
+            except ValueError as error:
+                raise UploadError(
+                    "文件长度无效"
+                ) from error
+
+            if length <= 0:
+                raise UploadError(
+                    "没有收到文档文件"
+                )
+
+            # V2.1.1 阶段暂时继续共用原 PDF 上传大小限制。
+            # 后续再统一重命名配置项，避免本轮同时修改 config。
+            if length > int(
+                config.max_pdf_upload_bytes
+            ):
+                raise UploadError(
+                    "文档超过上传大小限制",
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+
+            # -------------------------------------------------
+            # 1. 读取原始文件名，并确定文档类型
+            # -------------------------------------------------
+
+            encoded_name = self.headers.get(
+                "X-File-Name",
+                "document.pdf",
+            )
+
+            source_name = urllib.parse.unquote(
+                encoded_name
+            )
+
+            suffix = Path(
+                source_name
+            ).suffix.lower()
+
+            if suffix not in DOCUMENT_TYPES_BY_SUFFIX:
+                raise UploadError(
+                    "仅支持 PDF 或 PPTX 文件"
+                )
+
+            # -------------------------------------------------
+            # 2. 检查 Content-Type
+            # -------------------------------------------------
+
+            content_type = (
+                self.headers.get(
+                    "Content-Type",
+                    "",
+                )
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
+
+            # 某些浏览器/系统上传 Office 文件时可能不给 MIME，
+            # 此时按通用二进制流处理，后面仍会检查真实文件结构。
+            if not content_type:
+                content_type = "application/octet-stream"
+
+            allowed_content_types = (
+                DOCUMENT_CONTENT_TYPES.get(
+                    suffix,
+                    set(),
+                )
+            )
+
+            if content_type not in allowed_content_types:
+                if suffix == ".pdf":
+                    raise UploadError(
+                        "PDF文件类型无效"
+                    )
+
+                if suffix == ".pptx":
+                    raise UploadError(
+                        "PPTX文件类型无效"
+                    )
+
+                raise UploadError(
+                    "不支持的文档文件类型"
+                )
+
+            # -------------------------------------------------
+            # 3. 读取上传内容
+            # -------------------------------------------------
+
+            body = self.rfile.read(
+                length
+            )
+
             if len(body) != length:
-                raise UploadError("PDF上传不完整")
-            if not body.lstrip().startswith(b"%PDF-"):
-                raise UploadError("文件不是有效的PDF")
-            encoded_name = self.headers.get("X-File-Name", "document.pdf")
-            source_name = urllib.parse.unquote(encoded_name)
+                raise UploadError(
+                    "文档上传不完整"
+                )
+
+            # -------------------------------------------------
+            # 4. 根据文件类型检查真实文件结构
+            # -------------------------------------------------
+
+            if suffix == ".pdf":
+                if not body.lstrip().startswith(
+                    b"%PDF-"
+                ):
+                    raise UploadError(
+                        "文件不是有效的PDF"
+                    )
+
+            elif suffix == ".pptx":
+                try:
+                    with zipfile.ZipFile(
+                        io.BytesIO(body),
+                        "r",
+                    ) as archive:
+                        names = set(
+                            archive.namelist()
+                        )
+                except (
+                    zipfile.BadZipFile,
+                    OSError,
+                ) as error:
+                    raise UploadError(
+                        "文件不是有效的PPTX"
+                    ) from error
+
+                required_entries = {
+                    "[Content_Types].xml",
+                    "ppt/presentation.xml",
+                }
+
+                if not required_entries.issubset(
+                    names
+                ):
+                    raise UploadError(
+                        "文件不是有效的PPTX"
+                    )
+
+            # -------------------------------------------------
+            # 5. 生成安全的临时文件名
+            # -------------------------------------------------
+
             safe_stem = "".join(
-                char if char.isalnum() or char in "-_" else "_"
-                for char in Path(source_name).stem
+                char
+                if (
+                    char.isalnum()
+                    or char in "-_"
+                )
+                else "_"
+                for char in Path(
+                    source_name
+                ).stem
             ).strip("_")[:80] or "document"
-            config.pdf_input_dir.mkdir(parents=True, exist_ok=True)
-            input_path = config.pdf_input_dir / f"{safe_stem}_{request_id}.pdf"
-            input_path.write_bytes(body)
-            return input_path, source_name, length
+
+            # 当前仍然复用原 pdf_input_dir。
+            # 它现在实际上已经是“Web上传文档临时目录”。
+            config.pdf_input_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            input_path = (
+                config.pdf_input_dir
+                / (
+                    f"{safe_stem}_"
+                    f"{request_id}"
+                    f"{suffix}"
+                )
+            )
+
+            input_path.write_bytes(
+                body
+            )
+
+            return (
+                input_path,
+                source_name,
+                length,
+            )
 
         def _handle_trace(self, request_id):
             upload_path = None
@@ -493,98 +842,357 @@ def make_request_handler(config):
         def _handle_embed(self, request_id):
             started = time.perf_counter()
             input_path = None
+
             try:
-                encoded_number = self.headers.get("X-Watermark-Number", "")
+                # -------------------------------------------------
+                # 1. 读取并规范化用户水印号码
+                # -------------------------------------------------
+
+                encoded_number = self.headers.get(
+                    "X-Watermark-Number",
+                    "",
+                )
+
                 watermark_number = normalize_watermark_number(
-                    urllib.parse.unquote(encoded_number)
-                )
-                input_path, source_name, byte_count = self._receive_pdf(request_id)
-                config.pdf_output_dir.mkdir(parents=True, exist_ok=True)
-                safe_stem = "".join(
-                    char if char.isalnum() or char in "-_" else "_"
-                    for char in Path(source_name).stem
-                ).strip("_")[:80] or "document"
-                output_path = config.pdf_output_dir / (
-                    f"{safe_stem}_wm_{watermark_number}.pdf"
-                )
-                if output_path.exists():
-                    raise UploadError("该水印号码的输出PDF已存在", HTTPStatus.CONFLICT)
-                with config.trace_lock:
-                    manifest_path, manifest = embed_document_pdf(
-                        input_path,
-                        config.registry_path,
-                        key=config.key,
-                        output_pdf=output_path,
-                        assets_root=config.document_assets_dir,
-                        dpi=96,
-                        alpha=72.0,
-                        repeat=24,
-                        pilot_bits=64,
-                        pilot_repeat=8,
-                        pilot_alpha=90.0,
-                        recipient="web_demo_user",
-                        session=f"web_embed_{request_id}",
-                        notes=f"用户水印号码: {watermark_number}",
-                        watermark_number=watermark_number,
-                        source_name=source_name,
+                    urllib.parse.unquote(
+                        encoded_number
                     )
+                )
+
+                # -------------------------------------------------
+                # 2. 接收源文档
+                #
+                # 注意：
+                # _receive_pdf() 目前名字还没改，
+                # 但上一轮已经能够接收 PDF + PPTX。
+                # -------------------------------------------------
+
+                input_path, source_name, byte_count = (
+                    self._receive_pdf(
+                        request_id
+                    )
+                )
+
+                source_suffix = (
+                    input_path.suffix.lower()
+                )
+
+                if source_suffix not in DOCUMENT_TYPES_BY_SUFFIX:
+                    raise UploadError(
+                        "暂不支持该文档类型"
+                    )
+
+                source_type = DOCUMENT_TYPES_BY_SUFFIX[
+                    source_suffix
+                ]
+
+                # -------------------------------------------------
+                # 3. 生成输出文件路径
+                #
+                # 当前暂时继续复用 pdf_output_dir。
+                # 后续 Web 清理阶段再改名为通用 document_output_dir。
+                # -------------------------------------------------
+
+                config.pdf_output_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                safe_stem = "".join(
+                    char
+                    if (
+                        char.isalnum()
+                        or char in "-_"
+                    )
+                    else "_"
+                    for char in Path(
+                        source_name
+                    ).stem
+                ).strip("_")[:80] or "document"
+
+                output_path = (
+                    config.pdf_output_dir
+                    / (
+                        f"{safe_stem}"
+                        f"_wm_"
+                        f"{watermark_number}"
+                        f"{source_suffix}"
+                    )
+                )
+
+                if output_path.exists():
+                    document_label = (
+                        "PDF"
+                        if source_type == "pdf"
+                        else "PPTX"
+                    )
+
+                    raise UploadError(
+                        (
+                            f"该水印号码的输出"
+                            f"{document_label}"
+                            f"已存在"
+                        ),
+                        HTTPStatus.CONFLICT,
+                    )
+
+                # -------------------------------------------------
+                # 4. 进入统一 Document Pipeline
+                # -------------------------------------------------
+
+                with config.trace_lock:
+                    manifest_path, manifest = (
+                        embed_document(
+                            input_path=input_path,
+                            registry_path=config.registry_path,
+                            key=config.key,
+                            output_path=output_path,
+                            assets_root=(
+                                config.document_assets_dir
+                            ),
+                            dpi=96,
+                            alpha=72.0,
+                            repeat=24,
+                            pilot_bits=64,
+                            pilot_repeat=8,
+                            pilot_alpha=90.0,
+                            recipient="web_demo_user",
+                            session=(
+                                f"web_embed_"
+                                f"{request_id}"
+                            ),
+                            notes=(
+                                "用户水印号码: "
+                                f"{watermark_number}"
+                            ),
+                            watermark_number=(
+                                watermark_number
+                            ),
+                            source_name=source_name,
+                            source_type=source_type,
+                        )
+                    )
+
+                # -------------------------------------------------
+                # 5. 根据文档类型组织 Web 响应
+                # -------------------------------------------------
+
+                trace_token = manifest.get(
+                    "trace_token"
+                )
+
+                if not trace_token:
+                    raise RuntimeError(
+                        "文档发行完成但缺少 TraceToken"
+                    )
+
+                download_url = (
+                    f"/api/watermarks/"
+                    f"{trace_token}"
+                    f"/download"
+                )
+
+                # 当前只有 PDF 支持浏览器在线预览。
+                if source_type == "pdf":
+                    preview_url = (
+                        f"/api/watermarks/"
+                        f"{trace_token}"
+                        f"/preview"
+                    )
+
+                    description = (
+                        "水印PDF已生成并登记，"
+                        "可立即预览或下载。"
+                    )
+
+                    document_label = "PDF"
+
+                elif source_type == "pptx":
+                    preview_url = None
+
+                    description = (
+                        "水印PowerPoint已生成并登记，"
+                        "请下载后使用PowerPoint打开。"
+                    )
+
+                    document_label = "PPTX"
+
+                else:
+                    preview_url = None
+
+                    description = (
+                        "水印文档已生成并登记，"
+                        "可立即下载。"
+                    )
+
+                    document_label = (
+                        source_type.upper()
+                    )
+
+                watermark_info = (
+                    manifest.get("watermark")
+                    or {}
+                )
+
+                # -------------------------------------------------
+                # 6. 返回统一发行结果
+                # -------------------------------------------------
+
                 payload = {
                     "request_id": request_id,
                     "accepted": True,
                     "success": True,
                     "result": "EMBED_SUCCESS",
                     "message": "水印嵌入成功",
-                    "description": "水印PDF已生成并登记，可立即下载。",
-                    "watermark_number": watermark_number,
-                    "file_name": output_path.name,
-                    "download_url": "/api/download/" + urllib.parse.quote(output_path.name),
-                    "preview_url": f"/api/watermarks/{manifest.get('trace_token')}/preview",
-                    "page_count": manifest.get("page_count"),
-                    "source_bytes": byte_count,
-                    "document_id": manifest.get("document_id"),
-                    "trace_id": manifest.get("trace_id"),
-                    "trace_token": manifest.get("trace_token"),
-                    "manifest_name": manifest_path.name,
-                    "server_elapsed_ms": round(
-                        (time.perf_counter() - started) * 1000.0, 1
+                    "description": description,
+
+                    "source_type": source_type,
+                    "document_type": document_label,
+
+                    "watermark_number": (
+                        watermark_number
                     ),
+
+                    "file_name": output_path.name,
+
+                    "download_url": download_url,
+                    "preview_url": preview_url,
+
+                    "page_count": manifest.get(
+                        "page_count"
+                    ),
+
+                    "render_unit_type": manifest.get(
+                        "render_unit_type"
+                    ),
+
+                    "source_bytes": byte_count,
+
+                    "document_id": manifest.get(
+                        "document_id"
+                    ),
+
+                    "trace_id": manifest.get(
+                        "trace_id"
+                    ),
+
+                    "trace_token": trace_token,
+
+                    "manifest_name": (
+                        manifest_path.name
+                    ),
+
+                    "server_elapsed_ms": round(
+                        (
+                            time.perf_counter()
+                            - started
+                        )
+                        * 1000.0,
+                        1,
+                    ),
+
                     "technical": {
-                        "dpi": manifest.get("dpi"),
-                        "block_size": (manifest.get("watermark") or {}).get("block_size"),
-                        "payload_repeat": (manifest.get("watermark") or {}).get("repeat"),
-                        "payload_alpha": (manifest.get("watermark") or {}).get("alpha"),
-                        "manifest": manifest_path.name,
+                        "dpi": manifest.get(
+                            "dpi"
+                        ),
+
+                        "block_size": (
+                            watermark_info.get(
+                                "block_size"
+                            )
+                        ),
+
+                        "payload_repeat": (
+                            watermark_info.get(
+                                "repeat"
+                            )
+                        ),
+
+                        "payload_alpha": (
+                            watermark_info.get(
+                                "alpha"
+                            )
+                        ),
+
+                        "manifest": (
+                            manifest_path.name
+                        ),
                     },
                 }
-                self._send_json(HTTPStatus.OK, payload, request_id=request_id)
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    payload,
+                    request_id=request_id,
+                )
+
             except UploadError as error:
-                self._send_json(error.status, {
-                    "request_id": request_id,
-                    "accepted": False,
-                    "result": "INVALID_UPLOAD",
-                    "message": str(error),
-                }, request_id=request_id)
+                self._send_json(
+                    error.status,
+                    {
+                        "request_id": request_id,
+                        "accepted": False,
+                        "result": "INVALID_UPLOAD",
+                        "message": str(error),
+                    },
+                    request_id=request_id,
+                )
+
+            except NotImplementedError as error:
+                self._send_json(
+                    HTTPStatus.NOT_IMPLEMENTED,
+                    {
+                        "request_id": request_id,
+                        "accepted": False,
+                        "result": "DOCUMENT_TYPE_NOT_IMPLEMENTED",
+                        "message": str(error),
+                    },
+                    request_id=request_id,
+                )
+
             except ValueError as error:
                 message = str(error)
-                status = HTTPStatus.CONFLICT if "已存在" in message else HTTPStatus.BAD_REQUEST
-                self._send_json(status, {
-                    "request_id": request_id,
-                    "accepted": False,
-                    "result": "EMBED_REJECTED",
-                    "message": message,
-                }, request_id=request_id)
+
+                status = (
+                    HTTPStatus.CONFLICT
+                    if "已存在" in message
+                    else HTTPStatus.BAD_REQUEST
+                )
+
+                self._send_json(
+                    status,
+                    {
+                        "request_id": request_id,
+                        "accepted": False,
+                        "result": "EMBED_REJECTED",
+                        "message": message,
+                    },
+                    request_id=request_id,
+                )
+
             except Exception as error:
                 traceback.print_exc()
+
                 payload = {
                     "request_id": request_id,
                     "accepted": False,
                     "result": "PROCESSING_ERROR",
-                    "message": "PDF水印嵌入失败，请检查文件后重试",
+                    "message": (
+                        "文档水印嵌入失败，"
+                        "请检查文件后重试"
+                    ),
                 }
+
                 if config.debug:
-                    payload["debug"] = f"{type(error).__name__}: {error}"
+                    payload["debug"] = (
+                        f"{type(error).__name__}: "
+                        f"{error}"
+                    )
+
                 self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR, payload, request_id=request_id
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    payload,
+                    request_id=request_id,
                 )
 
         def _handle_delete_watermark(self, encoded_token):
