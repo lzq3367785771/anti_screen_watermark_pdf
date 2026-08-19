@@ -1,5 +1,14 @@
 import tempfile
 import unittest
+import json
+
+import cv2
+import numpy as np
+
+from document_carrier import (
+    issue_watermarked_pages,
+)
+
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,6 +50,189 @@ class DocumentPipelineTests(unittest.TestCase):
             detect_document_type("example.xlsx"),
             "xlsx",
         )
+
+
+    def test_generic_carrier_can_issue_rendered_pptx_slide(self):
+
+        with tempfile.TemporaryDirectory() as temporary:
+
+            root = Path(temporary)
+
+            source = (
+                root / "meeting.pptx"
+            )
+
+            source.write_bytes(
+                b"dummy-pptx-carrier-test"
+            )
+
+            reference = (
+                root / "slide_001.png"
+            )
+
+            image = np.full(
+                (480, 640, 3),
+                245,
+                np.uint8,
+            )
+
+            cv2.putText(
+                image,
+                "PowerPoint watermark test",
+                (60, 180),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (20, 20, 20),
+                2,
+                cv2.LINE_AA,
+            )
+
+            cv2.rectangle(
+                image,
+                (90, 230),
+                (550, 390),
+                (80, 120, 180),
+                4,
+            )
+
+            self.assertTrue(
+                cv2.imwrite(
+                    str(reference),
+                    image,
+                )
+            )
+
+            registry_path = (
+                root / "registry.json"
+            )
+
+            assets_dir = (
+                root / "assets"
+            )
+
+            result = issue_watermarked_pages(
+                source_path=source,
+
+                registry_path=
+                    registry_path,
+
+                page_records=[{
+                    "page_index": 1,
+
+                    "width": 640,
+
+                    "height": 480,
+
+                    "reference_path":
+                        str(
+                            reference.resolve()
+                        ),
+
+                    "reference_sha256":
+                        "test-reference",
+                }],
+
+                dpi=96,
+
+                media_box_points=[
+                    480,
+                    360,
+                ],
+
+                document_assets=
+                    assets_dir,
+
+                key=
+                    "carrier-test-key",
+
+                key_id=
+                    "carrier-test-key-id",
+
+                alpha=55.0,
+
+                repeat=2,
+
+                pilot_bits=16,
+
+                pilot_repeat=1,
+
+                pilot_alpha=60.0,
+
+                watermark_number=
+                    "PPT-TEST-001",
+
+                source_type="pptx",
+
+                render_unit_type="slide",
+            )
+
+            self.assertEqual(
+                len(
+                    result["encoded_bits"]
+                ),
+                140,
+            )
+
+            self.assertEqual(
+                result[
+                    "watermark_number"
+                ],
+                "PPT-TEST-001",
+            )
+
+            self.assertEqual(
+                len(
+                    result[
+                        "embedded_pages"
+                    ]
+                ),
+                1,
+            )
+
+            self.assertTrue(
+                result[
+                    "embedded_pages"
+                ][0].is_file()
+            )
+
+            with registry_path.open(
+                "r",
+                encoding="utf-8",
+            ) as file_obj:
+
+                registry = json.load(
+                    file_obj
+                )
+
+            document = registry[
+                "documents"
+            ][
+                result["document_id"]
+            ]
+
+            self.assertEqual(
+                document[
+                    "source_type"
+                ],
+                "pptx",
+            )
+
+            self.assertEqual(
+                document[
+                    "render_unit_type"
+                ],
+                "slide",
+            )
+
+            self.assertEqual(
+                document[
+                    "pages"
+                ][0][
+                    "unit_type"
+                ],
+                "slide",
+            )
+
 
 
     def test_unknown_document_type_is_rejected(self):

@@ -28,13 +28,17 @@ from document_registry import (
     attach_issue_artifact,
     decode_document_soft_scores,
     derive_page_key,
-    encode_document_token,
-    issue_document_trace,
     load_document_registry,
-    register_document,
     score_registered_tokens,
     sha256_file,
 )
+
+from document_carrier import (
+    embed_bits_adaptive,
+    issue_watermarked_pages,
+)
+
+
 from synchronization import (
     _pilot_measure,
     _warp_candidate,
@@ -132,60 +136,6 @@ def render_pdf_pages(pdf_path, output_dir, dpi=150, poppler_bin=None):
     return pages, completed.stderr.strip()
 
 
-def _adaptive_alpha(block, base_alpha):
-    mean = float(np.mean(block))
-    deviation = float(np.std(block))
-    if mean >= 247.0 and deviation <= 2.5:
-        scale = 0.60
-    elif deviation < 7.0:
-        scale = 0.78
-    elif deviation > 35.0:
-        scale = 1.12
-    else:
-        scale = 1.0
-    return max(12.0, float(base_alpha) * scale)
-
-
-def embed_bits_adaptive(
-    image,
-    bits,
-    key,
-    alpha,
-    repeat,
-    block_size=8,
-    position_offset=0,
-):
-    if image is None:
-        raise ValueError("输入页面为空")
-    height, width = image.shape[:2]
-    total_count = int(position_offset) + len(bits) * int(repeat)
-    positions = generate_positions(
-        height, width, key, total_count, block_size=int(block_size)
-    )
-    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-    y, cr, cb = cv2.split(ycrcb)
-    index = int(position_offset)
-    alpha_values = []
-    for bit in bits:
-        for _ in range(int(repeat)):
-            row, col = positions[index]
-            index += 1
-            y1 = row * int(block_size)
-            x1 = col * int(block_size)
-            block = y[y1:y1 + int(block_size), x1:x1 + int(block_size)]
-            local_alpha = _adaptive_alpha(block, alpha)
-            alpha_values.append(local_alpha)
-            y[y1:y1 + int(block_size), x1:x1 + int(block_size)] = embed_bit(
-                block, int(bit), alpha=local_alpha
-            )
-    result = cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2BGR)
-    return result, {
-        "alpha_min": float(min(alpha_values)),
-        "alpha_max": float(max(alpha_values)),
-        "alpha_mean": float(np.mean(alpha_values)),
-        "dct_units": len(alpha_values),
-    }
-
 
 def _save_raster_pdf(page_images, output_pdf, dpi):
     pil_pages = []
@@ -273,74 +223,59 @@ def embed_document_pdf(
             float(first_shape[1]) * 72.0 / float(dpi),
             float(first_shape[0]) * 72.0 / float(dpi),
         ]
-        document_id, document = register_document(
-            registry_path,
-            input_pdf,
-            page_records,
-            dpi,
-            media_box,
-            document_assets,
-            source_name=source_name,
-        )
-        issue = issue_document_trace(
-            registry_path,
-            document_id,
+
+        carrier = issue_watermarked_pages(
+            source_path=input_pdf,
+            registry_path=registry_path,
+            page_records=page_records,
+            dpi=dpi,
+            media_box_points=media_box,
+            document_assets=document_assets,
+            key=key,
+            key_id=_key_id(key),
+            alpha=alpha,
+            repeat=repeat,
+            pilot_bits=pilot_bits,
+            pilot_repeat=pilot_repeat,
+            pilot_alpha=pilot_alpha,
+            recipient=recipient,
+            session=session,
+            notes=notes,
             trace_token=trace_token,
             watermark_number=watermark_number,
-            metadata={
-                "recipient": recipient,
-                "session": session,
-                "notes": notes,
-                "key_id": _key_id(key),
-            },
+            source_name=source_name,
+            source_type="pdf",
+            render_unit_type="page",
         )
-        token = issue["trace_token"]
-        if output_pdf is None:
-            public_number = issue.get("watermark_number") or token
-            output_pdf = input_pdf.with_name(
-                f"{input_pdf.stem}_wm_{public_number}.pdf"
-            )
-        output_pdf = Path(output_pdf).resolve()
-        manifest_path = output_pdf.with_suffix(".manifest.json")
-        payload = encode_document_token(token)
 
-        issue_page_dir = document_assets / "issues" / token
-        issue_page_dir.mkdir(parents=True, exist_ok=True)
-        embedded_pages = []
-        manifest_pages = []
-        for page_record in page_records:
-            page_index = page_record["page_index"]
-            image = cv2.imread(page_record["reference_path"], cv2.IMREAD_COLOR)
-            page_key = derive_page_key(key, document_id, page_index)
-            watermarked, payload_stats = embed_bits_adaptive(
-                image,
-                payload,
-                page_key,
-                alpha=alpha,
-                repeat=repeat,
-                block_size=8,
-                position_offset=0,
-            )
-            pilot = generate_sync_pilot(page_key, int(pilot_bits))
-            watermarked, pilot_stats = embed_bits_adaptive(
-                watermarked,
-                pilot,
-                page_key,
-                alpha=pilot_alpha,
-                repeat=pilot_repeat,
-                block_size=8,
-                position_offset=DOCUMENT_CODEWORD_BITS * int(repeat),
-            )
-            target = issue_page_dir / f"page_{page_index:03d}_watermarked.png"
-            if not cv2.imwrite(str(target), watermarked):
-                raise RuntimeError(f"无法保存水印页面: {target}")
-            embedded_pages.append(target)
-            manifest_pages.append({
-                **page_record,
-                "watermarked_page_sha256": sha256_file(target),
-                "payload_embedding": payload_stats,
-                "pilot_embedding": pilot_stats,
-            })
+        document_id = carrier[
+            "document_id"
+        ]
+
+        document = carrier[
+            "document"
+        ]
+
+        issue = carrier[
+            "issue"
+        ]
+
+        token = carrier[
+            "trace_token"
+        ]
+
+        payload = carrier[
+            "encoded_bits"
+        ]
+
+        embedded_pages = carrier[
+            "embedded_pages"
+        ]
+
+        manifest_pages = carrier[
+            "manifest_pages"
+        ]
+
 
         _save_raster_pdf(embedded_pages, output_pdf, dpi=dpi)
         manifest = {
