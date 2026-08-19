@@ -11,6 +11,7 @@ from document_carrier import (
     issue_watermarked_pages,
 )
 from document_registry import (
+    DOCUMENT_CODEWORD_BITS,
     DOCUMENT_WATERMARK_VERSION,
     attach_issue_artifact,
     sha256_file,
@@ -337,14 +338,25 @@ def embed_document_pptx(
     )
 
     manifest = {
+        "schema_version":
+            1,
+
         "pipeline_version":
             PPTX_PIPELINE_VERSION,
 
-        # 注意：
-        # Carrier的物理水印协议仍然沿用现有版本，
-        # 不要因为PPTX就擅自修改derive_page_key。
+        # --------------------------------------------------------
+        # 物理水印协议版本
+        # --------------------------------------------------------
+
+        "watermark_version":
+            DOCUMENT_WATERMARK_VERSION,
+
         "carrier_version":
             DOCUMENT_WATERMARK_VERSION,
+
+        # --------------------------------------------------------
+        # 文档类型
+        # --------------------------------------------------------
 
         "source_type":
             "pptx",
@@ -352,11 +364,21 @@ def embed_document_pptx(
         "render_unit_type":
             "slide",
 
+        # --------------------------------------------------------
+        # 源文件 / 输出文件
+        # --------------------------------------------------------
+
+        "source_path":
+            str(input_pptx),
+
         "source_pptx":
             str(input_pptx),
 
         "source_sha256":
             source_sha256,
+
+        "output_path":
+            str(output_pptx),
 
         "output_pptx":
             str(output_pptx),
@@ -366,10 +388,19 @@ def embed_document_pptx(
                 output_pptx
             ),
 
+        # --------------------------------------------------------
+        # Document / Issue
+        # --------------------------------------------------------
+
         "document_id":
             carrier[
                 "document_id"
             ],
+
+        "page_count":
+            len(
+                page_records
+            ),
 
         "trace_id":
             carrier[
@@ -391,12 +422,52 @@ def embed_document_pptx(
                 "encoded_bits"
             ],
 
+        # --------------------------------------------------------
+        # 渲染几何
+        # --------------------------------------------------------
+
+        "dpi":
+            int(dpi),
+
+        "media_box_points": [
+            float(
+                render_info[
+                    "slide_width_points"
+                ]
+            ),
+
+            float(
+                render_info[
+                    "slide_height_points"
+                ]
+            ),
+        ],
+
         "rendering":
             render_info,
 
-        "embedding": {
-            "dpi":
-                int(dpi),
+        # --------------------------------------------------------
+        # 非常重要：
+        #
+        # trace_document_photo()会直接检查这个字段。
+        # --------------------------------------------------------
+
+        "key_id":
+            _key_id(key),
+
+        # --------------------------------------------------------
+        # 非常重要：
+        #
+        # 这里必须保持和PDF Manifest相同的Carrier配置结构。
+        # trace_document_photo()、PN同步、DCT提取都会读取它。
+        # --------------------------------------------------------
+
+        "watermark": {
+            "block_size":
+                8,
+
+            "bit_count":
+                DOCUMENT_CODEWORD_BITS,
 
             "alpha":
                 float(alpha),
@@ -404,21 +475,58 @@ def embed_document_pptx(
             "repeat":
                 int(repeat),
 
-            "pilot_bits":
-                int(pilot_bits),
+            "adaptive_alpha":
+                True,
 
-            "pilot_repeat":
-                int(pilot_repeat),
+            "sync_pilot": {
+                "enabled":
+                    True,
 
-            "pilot_alpha":
-                float(pilot_alpha),
+                "version":
+                    "pn64-v1",
+
+                "bit_count":
+                    int(
+                        pilot_bits
+                    ),
+
+                "repeat":
+                    int(
+                        pilot_repeat
+                    ),
+
+                "alpha":
+                    float(
+                        pilot_alpha
+                    ),
+
+                "position_offset":
+                    (
+                        DOCUMENT_CODEWORD_BITS
+                        * int(repeat)
+                    ),
+            },
         },
 
-        "pages":
-            carrier[
-                "manifest_pages"
-            ],
-    }
+    # --------------------------------------------------------
+    # PPTX特有信息
+    # --------------------------------------------------------
+
+    "output_mode":
+        "flattened_slide_images",
+
+    "editable":
+        False,
+
+    # --------------------------------------------------------
+    # 页面 / Slide
+    # --------------------------------------------------------
+
+    "pages":
+        carrier[
+            "manifest_pages"
+        ],
+}
 
     _write_json(
         manifest_path,
