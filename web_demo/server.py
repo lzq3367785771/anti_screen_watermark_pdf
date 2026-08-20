@@ -34,9 +34,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from document_registry import (  # noqa: E402
     load_document_registry,
+    load_registered_reference_set,
     normalize_trace_token,
     normalize_watermark_number,
     retire_document_issue,
+    sha256_file,
 )
 from document_pipeline import embed_document  # noqa: E402
 from pdf_pipeline import (  # noqa: E402
@@ -107,13 +109,13 @@ class DemoConfig:
     registry_path: Path
     upload_dir: Path
     report_dir: Path
-    pdf_input_dir: Path
-    pdf_output_dir: Path
+    document_input_dir: Path
+    document_output_dir: Path
     document_assets_dir: Path
     trash_dir: Path
     key: str = DEFAULT_KEY
     max_upload_bytes: int = 30 * 1024 * 1024
-    max_pdf_upload_bytes: int = 100 * 1024 * 1024
+    max_document_upload_bytes: int = 100 * 1024 * 1024
     max_pixels: int = 40_000_000
     keep_uploads: bool = False
     debug: bool = False
@@ -420,9 +422,7 @@ def make_request_handler(config):
                     download=route_parts[3] == "download",
                 )
                 return
-            if route.startswith("/api/download/"):
-                self._send_pdf_download(route.removeprefix("/api/download/"))
-                return
+
             static = STATIC_ROUTES.get(route)
             if static:
                 self._send_static(*static)
@@ -555,28 +555,7 @@ def make_request_handler(config):
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_pdf_download(self, encoded_name):
-            file_name = urllib.parse.unquote(encoded_name)
-            if (
-                not file_name
-                or Path(file_name).name != file_name
-                or Path(file_name).suffix.lower() != ".pdf"
-            ):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "下载文件名无效"})
-                return
-            path = config.pdf_output_dir / file_name
-            if not path.is_file():
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "水印PDF不存在"})
-                return
-            body = path.read_bytes()
-            self.send_response(HTTPStatus.OK)
-            self._common_headers("application/pdf", len(body))
-            quoted = urllib.parse.quote(file_name)
-            self.send_header(
-                "Content-Disposition", f"attachment; filename*=UTF-8''{quoted}"
-            )
-            self.end_headers()
-            self.wfile.write(body)
+
 
         def _receive_image(self, request_id):
             try:
@@ -610,14 +589,14 @@ def make_request_handler(config):
             upload_path.write_bytes(body)
             return upload_path, {"width": width, "height": height, "bytes": length}
 
-        def _receive_pdf(self, request_id):
+        def _receive_document(self, request_id):
+
             """
             Receive a supported source document.
 
-            NOTE:
-            The method name is temporarily kept as _receive_pdf for backward
-            compatibility with the current _handle_embed(). It will be renamed
-            to _receive_document() when the embed handler is generalized.
+            Currently supported:
+                PDF
+                PPTX
             """
 
             import io
@@ -640,10 +619,9 @@ def make_request_handler(config):
                     "没有收到文档文件"
                 )
 
-            # V2.1.1 阶段暂时继续共用原 PDF 上传大小限制。
-            # 后续再统一重命名配置项，避免本轮同时修改 config。
+# 文档上传大小限制，当前适用于 PDF 和 PPTX。
             if length > int(
-                config.max_pdf_upload_bytes
+                config.max_document_upload_bytes
             ):
                 raise UploadError(
                     "文档超过上传大小限制",
@@ -783,15 +761,14 @@ def make_request_handler(config):
                 ).stem
             ).strip("_")[:80] or "document"
 
-            # 当前仍然复用原 pdf_input_dir。
-            # 它现在实际上已经是“Web上传文档临时目录”。
-            config.pdf_input_dir.mkdir(
+# Web 上传源文档临时目录。
+            config.document_input_dir.mkdir(
                 parents=True,
                 exist_ok=True,
             )
 
             input_path = (
-                config.pdf_input_dir
+                config.document_input_dir
                 / (
                     f"{safe_stem}_"
                     f"{request_id}"
@@ -882,13 +859,11 @@ def make_request_handler(config):
                 # -------------------------------------------------
                 # 2. 接收源文档
                 #
-                # 注意：
-                # _receive_pdf() 目前名字还没改，
-                # 但上一轮已经能够接收 PDF + PPTX。
+                # 接收并验证受支持的源文档。
                 # -------------------------------------------------
 
                 input_path, source_name, byte_count = (
-                    self._receive_pdf(
+                    self._receive_document(
                         request_id
                     )
                 )
@@ -906,18 +881,77 @@ def make_request_handler(config):
                     source_suffix
                 ]
 
-                embed_profile = DOCUMENT_EMBED_PROFILES[
-                    source_type
-                ]
+                # -------------------------------------------------
+                # 选择本次发行Profile。
+                #
+                # 必须复制，不能直接修改全局
+                # DOCUMENT_EMBED_PROFILES。
+                # -------------------------------------------------
+
+                embed_profile = dict(
+                    DOCUMENT_EMBED_PROFILES[
+                        source_type
+                    ]
+                )
+
+                # -------------------------------------------------
+                # Canonical DPI兼容。
+                #
+                # Document ID由源文件SHA256前24位稳定确定。
+                #
+                # 新Document：
+                #   使用当前格式默认DPI。
+                #
+                # 已登记Document：
+                #   沿用已建立的Canonical DPI，
+                #   避免升级Web Profile后与旧参考集冲突。
+                #
+                # Canonical Reference本身仍由Registry helper
+                # 做完整性、source_type、文件SHA256等检查。
+                # -------------------------------------------------
+
+                source_sha256 = sha256_file(
+                    input_path
+                )
+
+                document_id_hint = (
+                    source_sha256[:24]
+                )
+
+                registered_reference = (
+                    load_registered_reference_set(
+                        config.registry_path,
+                        document_id_hint,
+                        expected_source_type=source_type,
+                    )
+                )
+
+                if registered_reference is not None:
+
+                    registered_dpi = (
+                        registered_reference.get(
+                            "dpi"
+                        )
+                    )
+
+                    if registered_dpi is None:
+                        raise ValueError(
+                            "已登记Document缺少Canonical DPI"
+                        )
+
+                    embed_profile[
+                        "dpi"
+                    ] = int(
+                        registered_dpi
+                    )
 
                 # -------------------------------------------------
                 # 3. 生成输出文件路径
                 #
-                # 当前暂时继续复用 pdf_output_dir。
-                # 后续 Web 清理阶段再改名为通用 document_output_dir。
+# 最终水印文档输出目录。
                 # -------------------------------------------------
 
-                config.pdf_output_dir.mkdir(
+                config.document_output_dir.mkdir(
                     parents=True,
                     exist_ok=True,
                 )
@@ -935,7 +969,7 @@ def make_request_handler(config):
                 ).strip("_")[:80] or "document"
 
                 output_path = (
-                    config.pdf_output_dir
+                    config.document_output_dir
                     / (
                         f"{safe_stem}"
                         f"_wm_"
@@ -1376,21 +1410,155 @@ def make_request_handler(config):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="文档水印发行与溯源本地网页Demo")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--registry", default=str(PROJECT_ROOT / "document_registry.json"))
-    parser.add_argument("--key", default=DEFAULT_KEY)
-    parser.add_argument("--upload-dir", default=str(WEB_ROOT / "runtime" / "uploads"))
-    parser.add_argument("--report-dir", default=str(WEB_ROOT / "runtime" / "reports"))
-    parser.add_argument("--pdf-input-dir", default=str(WEB_ROOT / "runtime" / "pdf_inputs"))
-    parser.add_argument("--pdf-output-dir", default=str(WEB_ROOT / "runtime" / "outputs"))
-    parser.add_argument("--document-assets-dir", default=str(WEB_ROOT / "runtime" / "document_assets"))
-    parser.add_argument("--trash-dir", default=str(WEB_ROOT / "runtime" / "trash"))
-    parser.add_argument("--max-upload-mb", type=int, default=30)
-    parser.add_argument("--max-pdf-mb", type=int, default=100)
-    parser.add_argument("--keep-uploads", action="store_true")
-    parser.add_argument("--debug", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="文档水印发行与溯源本地网页Demo"
+    )
+
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+    )
+
+    parser.add_argument(
+        "--registry",
+        default=str(
+            PROJECT_ROOT
+            / "document_registry.json"
+        ),
+    )
+
+    parser.add_argument(
+        "--key",
+        default=DEFAULT_KEY,
+    )
+
+    # --------------------------------------------------------
+    # Trace image upload
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--upload-dir",
+        default=str(
+            WEB_ROOT
+            / "runtime"
+            / "uploads"
+        ),
+    )
+
+    parser.add_argument(
+        "--report-dir",
+        default=str(
+            WEB_ROOT
+            / "runtime"
+            / "reports"
+        ),
+    )
+
+    parser.add_argument(
+        "--max-upload-mb",
+        type=int,
+        default=30,
+    )
+
+    # --------------------------------------------------------
+    # Source document input
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--document-input-dir",
+        dest="document_input_dir",
+        default=str(
+            WEB_ROOT
+            / "runtime"
+            / "document_inputs"
+        ),
+    )
+
+    # Legacy V2.0/V2.1 CLI alias.
+    parser.add_argument(
+        "--pdf-input-dir",
+        dest="document_input_dir",
+        help=argparse.SUPPRESS,
+    )
+
+    # --------------------------------------------------------
+    # Issued document output
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--document-output-dir",
+        dest="document_output_dir",
+        default=str(
+            WEB_ROOT
+            / "runtime"
+            / "outputs"
+        ),
+    )
+
+    # Legacy V2.0/V2.1 CLI alias.
+    parser.add_argument(
+        "--pdf-output-dir",
+        dest="document_output_dir",
+        help=argparse.SUPPRESS,
+    )
+
+    # --------------------------------------------------------
+    # Document assets / trash
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--document-assets-dir",
+        default=str(
+            WEB_ROOT
+            / "runtime"
+            / "document_assets"
+        ),
+    )
+
+    parser.add_argument(
+        "--trash-dir",
+        default=str(
+            WEB_ROOT
+            / "runtime"
+            / "trash"
+        ),
+    )
+
+    # --------------------------------------------------------
+    # Source document upload size
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--max-document-mb",
+        dest="max_document_mb",
+        type=int,
+        default=100,
+    )
+
+    # Legacy V2.0/V2.1 CLI alias.
+    parser.add_argument(
+        "--max-pdf-mb",
+        dest="max_document_mb",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--keep-uploads",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+    )
+
     return parser
 
 
@@ -1400,13 +1568,27 @@ def main():
         registry_path=Path(args.registry).resolve(),
         upload_dir=Path(args.upload_dir).resolve(),
         report_dir=Path(args.report_dir).resolve(),
-        pdf_input_dir=Path(args.pdf_input_dir).resolve(),
-        pdf_output_dir=Path(args.pdf_output_dir).resolve(),
+        document_input_dir=Path(
+            args.document_input_dir
+        ).resolve(),
+
+        document_output_dir=Path(
+            args.document_output_dir
+        ).resolve(),
         document_assets_dir=Path(args.document_assets_dir).resolve(),
         trash_dir=Path(args.trash_dir).resolve(),
         key=args.key,
-        max_upload_bytes=max(1, int(args.max_upload_mb)) * 1024 * 1024,
-        max_pdf_upload_bytes=max(1, int(args.max_pdf_mb)) * 1024 * 1024,
+        max_document_upload_bytes=(
+        max(
+            1,
+            int(
+                args.max_document_mb
+            ),
+        )
+        * 1024
+        * 1024
+    ),
+
         keep_uploads=bool(args.keep_uploads),
         debug=bool(args.debug),
     )
