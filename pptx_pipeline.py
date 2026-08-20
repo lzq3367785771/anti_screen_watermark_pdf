@@ -31,15 +31,25 @@ PPTX_PIPELINE_VERSION = "pptx-v2.1.1"
 
 
 def _write_json(path, data):
+    """Atomically write one PPTX issuance manifest."""
 
-    path = Path(path)
+    path = Path(
+        path
+    )
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with path.open(
+    temporary = (
+        path.with_suffix(
+            path.suffix
+            + ".tmp"
+        )
+    )
+
+    with temporary.open(
         "w",
         encoding="utf-8",
     ) as file_obj:
@@ -50,6 +60,10 @@ def _write_json(path, data):
             ensure_ascii=False,
             indent=2,
         )
+
+    temporary.replace(
+        path
+    )
 
 
 def _key_id(key):
