@@ -21,8 +21,8 @@ const elements = {
 
   watermarkNumber: $("#watermarkNumber"),
 
-  // HTML ID 暂时继续沿用 pdf* 名称，
-  // 但 JS 逻辑已经泛化为 PDF / PPTX 文档。
+// 保留现有 pdf* DOM 名称以避免无必要的前端结构变更。
+// 实际上传逻辑已经同时支持 PDF 和 PPTX。
   pdfInput: $("#pdfInput"),
   pdfDropZone: $("#pdfDropZone"),
   pdfPreviewPanel: $("#pdfPreviewPanel"),
