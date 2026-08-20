@@ -41,7 +41,6 @@ from document_registry import (  # noqa: E402
 from document_pipeline import embed_document  # noqa: E402
 from pdf_pipeline import (  # noqa: E402
     DEFAULT_KEY,
-    embed_document_pdf,
     trace_document_photo,
 )
 
@@ -56,6 +55,27 @@ DOCUMENT_TYPES_BY_SUFFIX = {
     ".pdf": "pdf",
     ".pptx": "pptx",
 }
+
+DOCUMENT_EMBED_PROFILES = {
+    "pdf": {
+        "dpi": 150,
+        "alpha": 42.0,
+        "repeat": 16,
+        "pilot_bits": 64,
+        "pilot_repeat": 6,
+        "pilot_alpha": 78.0,
+    },
+
+    "pptx": {
+        "dpi": 96,
+        "alpha": 72.0,
+        "repeat": 24,
+        "pilot_bits": 64,
+        "pilot_repeat": 8,
+        "pilot_alpha": 90.0,
+    },
+}
+
 
 DOCUMENT_CONTENT_TYPES = {
     ".pdf": {
@@ -886,6 +906,10 @@ def make_request_handler(config):
                     source_suffix
                 ]
 
+                embed_profile = DOCUMENT_EMBED_PROFILES[
+                    source_type
+                ]
+
                 # -------------------------------------------------
                 # 3. 生成输出文件路径
                 #
@@ -950,12 +974,29 @@ def make_request_handler(config):
                             assets_root=(
                                 config.document_assets_dir
                             ),
-                            dpi=96,
-                            alpha=72.0,
-                            repeat=24,
-                            pilot_bits=64,
-                            pilot_repeat=8,
-                            pilot_alpha=90.0,
+                            dpi=embed_profile[
+                                "dpi"
+                            ],
+
+                            alpha=embed_profile[
+                                "alpha"
+                            ],
+
+                            repeat=embed_profile[
+                                "repeat"
+                            ],
+
+                            pilot_bits=embed_profile[
+                                "pilot_bits"
+                            ],
+
+                            pilot_repeat=embed_profile[
+                                "pilot_repeat"
+                            ],
+
+                            pilot_alpha=embed_profile[
+                                "pilot_alpha"
+                            ],
                             recipient="web_demo_user",
                             session=(
                                 f"web_embed_"
@@ -1215,10 +1256,60 @@ def make_request_handler(config):
                     datetime.now().strftime("%Y%m%d_%H%M%S_") + token
                 )
                 candidates = []
-                output_path = Path(issue.get("output_pdf", "")) if issue.get("output_pdf") else None
-                manifest_path = Path(issue.get("manifest_path", "")) if issue.get("manifest_path") else None
-                if output_path and output_path.is_file() and output_path.suffix.lower() == ".pdf":
-                    candidates.append((output_path, "watermarked.pdf"))
+
+                # ---------------------------------------------------------
+                # V2.1+ 通用发行物路径。
+                #
+                # 新记录优先使用 output_path；
+                # 老 PDF 注册记录继续兼容 output_pdf。
+                # ---------------------------------------------------------
+
+                output_value = (
+                    issue.get("output_path")
+                    or issue.get("output_pdf")
+                )
+
+                output_path = (
+                    Path(output_value)
+                    if output_value
+                    else None
+                )
+
+                manifest_path = (
+                    Path(issue.get("manifest_path", ""))
+                    if issue.get("manifest_path")
+                    else None
+                )
+
+                # ---------------------------------------------------------
+                # 当前 Web Demo 支持回收的最终发行物：
+                #
+                #   PDF
+                #   PPTX
+                #
+                # 使用 ARTIFACT_CONTENT_TYPES 作为允许类型白名单，
+                # 避免把注册记录中任意未知文件一起移动。
+                # ---------------------------------------------------------
+
+                if (
+                    output_path
+                    and output_path.is_file()
+                ):
+
+                    output_suffix = (
+                        output_path.suffix.lower()
+                    )
+
+                    if (
+                        output_suffix
+                        in ARTIFACT_CONTENT_TYPES
+                    ):
+                        candidates.append(
+                            (
+                                output_path,
+                                f"watermarked{output_suffix}",
+                            )
+                        )
                 if manifest_path and manifest_path.is_file() and manifest_path.suffix.lower() == ".json":
                     candidates.append((manifest_path, "manifest.json"))
                 assets_dir = Path(document.get("assets_dir", "")) if document.get("assets_dir") else None
