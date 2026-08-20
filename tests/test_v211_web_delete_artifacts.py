@@ -38,12 +38,12 @@ class WebDeleteArtifactTests(unittest.TestCase):
                 / "reports"
             ),
 
-            pdf_input_dir=(
+            document_input_dir=(
                 self.root
                 / "document_inputs"
             ),
 
-            pdf_output_dir=(
+            document_output_dir=(
                 self.root
                 / "document_outputs"
             ),
