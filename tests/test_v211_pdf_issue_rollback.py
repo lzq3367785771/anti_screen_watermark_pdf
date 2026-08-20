@@ -10,23 +10,19 @@ from document_registry import (
     load_document_registry,
     sha256_file,
 )
-from pdf_pipeline import embed_document_pdf
+from pdf_pipeline import (
+    embed_document_pdf,
+)
 
 
 class PDFIssueRollbackTests(unittest.TestCase):
-    """Failure-injection tests for PDF issuance rollback."""
+    """Failure-injection tests for PDF issuance transaction."""
 
     def setUp(self):
-        # ----------------------------------------------------
-        # 每个测试都在独立临时目录中运行。
-        #
-        # 不会碰真实：
-        # document_registry.json
-        # document_assets
-        # Web输出目录
-        # ----------------------------------------------------
 
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = (
+            tempfile.TemporaryDirectory()
+        )
 
         self.root = Path(
             self.temp_dir.name
@@ -58,11 +54,8 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         # ----------------------------------------------------
-        # embed_document_pdf() 在本测试中不会真正调用
-        # Poppler，因为 render_pdf_pages() 会被 patch。
-        #
-        # 因此这里只需要一个稳定存在、可参与 SHA256 的
-        # 源文件即可。
+        # render_pdf_pages()会被mock，
+        # 所以源PDF只需要稳定存在并可计算SHA256。
         # ----------------------------------------------------
 
         self.input_pdf.write_bytes(
@@ -71,13 +64,7 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         # ----------------------------------------------------
-        # 创建真实参考页面。
-        #
-        # 512 × 512 足够承载测试参数：
-        #
-        # 140 payload bits × repeat 1
-        # +
-        # 16 pilot bits × repeat 1
+        # Carrier仍然需要读取真实页面图像。
         # ----------------------------------------------------
 
         image = np.full(
@@ -91,7 +78,9 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         written = cv2.imwrite(
-            str(self.rendered_page),
+            str(
+                self.rendered_page
+            ),
             image,
         )
 
@@ -113,49 +102,82 @@ class PDFIssueRollbackTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    # ----------------------------------------------------
+    # ========================================================
     # Helpers
-    # ----------------------------------------------------
+    # ========================================================
 
     def _embed(
         self,
         token,
         watermark_number,
     ):
-        # ------------------------------------------------
-        # render_pdf_pages() 被替换为固定测试页面。
+        # ----------------------------------------------------
+        # PDF renderer可以返回外部临时页面。
         #
-        # 这样：
-        #   不依赖 Poppler
-        #   不启动外部进程
-        #   测试速度快且确定
-        # ------------------------------------------------
+        # _prepare_pdf_reference_set()会把它复制到自己拥有的
+        # Canonical staging目录，再发布reference_pages。
+        # ----------------------------------------------------
 
         with patch(
             "pdf_pipeline.render_pdf_pages",
             return_value=(
-                [self.rendered_page],
+                [
+                    self.rendered_page
+                ],
                 "",
             ),
         ):
             return embed_document_pdf(
-                input_pdf=self.input_pdf,
-                registry_path=self.registry_path,
-                key="TEST_PDF_ROLLBACK_KEY",
-                output_pdf=self.output_pdf,
-                assets_root=self.assets_root,
-                dpi=96,
-                alpha=20.0,
-                repeat=1,
-                pilot_bits=16,
-                pilot_repeat=1,
-                pilot_alpha=20.0,
-                recipient="unit_test",
-                session="pdf_rollback_test",
-                notes="V2.1.1-F2-B2-Test",
-                trace_token=token,
-                watermark_number=watermark_number,
-                source_name="source.pdf",
+                input_pdf=
+                    self.input_pdf,
+
+                registry_path=
+                    self.registry_path,
+
+                key=
+                    "TEST_PDF_ROLLBACK_KEY",
+
+                output_pdf=
+                    self.output_pdf,
+
+                assets_root=
+                    self.assets_root,
+
+                dpi=
+                    96,
+
+                alpha=
+                    20.0,
+
+                repeat=
+                    1,
+
+                pilot_bits=
+                    16,
+
+                pilot_repeat=
+                    1,
+
+                pilot_alpha=
+                    20.0,
+
+                recipient=
+                    "unit_test",
+
+                session=
+                    "pdf_rollback_test",
+
+                notes=
+                    "V2.1.1-F2-B2-Test",
+
+                trace_token=
+                    token,
+
+                watermark_number=
+                    watermark_number,
+
+                source_name=
+                    "source.pdf",
             )
 
     def _issue_dir(
@@ -192,7 +214,14 @@ class PDFIssueRollbackTests(unittest.TestCase):
             + ".tmp"
         )
 
-    def _backup_path(
+    def _output_tmp_path(
+        self,
+    ):
+        return self.output_pdf.with_suffix(
+            ".tmp.pdf"
+        )
+
+    def _output_backup_path(
         self,
         token,
     ):
@@ -228,16 +257,28 @@ class PDFIssueRollbackTests(unittest.TestCase):
             ).exists()
         )
 
-    # ----------------------------------------------------
-    # 1.
-    # Carrier内部已经创建issue，
-    # 但随后页面嵌入失败。
-    #
-    # 预期：
-    #   Registry issue删除
-    #   issues/<token>/删除
-    #   不产生output PDF
-    # ----------------------------------------------------
+    @staticmethod
+    def _successful_pdf_save(
+        image_paths,
+        output_pdf,
+        dpi=150,
+    ):
+        # ----------------------------------------------------
+        # Transaction测试不需要生成真实PDF结构。
+        #
+        # 这里只模拟：
+        # _save_raster_pdf()成功后最终文件已经存在。
+        # ----------------------------------------------------
+
+        Path(
+            output_pdf
+        ).write_bytes(
+            b"NEW_WATERMARKED_PDF"
+        )
+
+    # ========================================================
+    # 1. Carrier失败
+    # ========================================================
 
     def test_carrier_failure_rolls_back_issue_and_issue_directory(
         self,
@@ -247,11 +288,15 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         with patch(
-            "document_carrier.embed_bits_adaptive",
-            side_effect=RuntimeError(
-                "forced carrier failure"
-            ),
+            "document_carrier."
+            "embed_bits_adaptive",
+
+            side_effect=
+                RuntimeError(
+                    "forced carrier failure"
+                ),
         ):
+
             with self.assertRaisesRegex(
                 RuntimeError,
                 "forced carrier failure",
@@ -279,20 +324,12 @@ class PDFIssueRollbackTests(unittest.TestCase):
             ).exists()
         )
 
-    # ----------------------------------------------------
-    # 2.
-    # PDF生成阶段失败。
+    # ========================================================
+    # 2. PDF写入失败
     #
-    # 同时模拟：
-    #   output PDF原本已经存在
-    #   _save_raster_pdf() 创建了.tmp.pdf后失败
-    #
-    # 预期：
-    #   原output恢复
-    #   新tmp删除
-    #   Registry issue删除
-    #   issue目录删除
-    # ----------------------------------------------------
+    # 旧output必须恢复，
+    # 本次.tmp必须删除。
+    # ========================================================
 
     def test_pdf_write_failure_restores_old_output_and_removes_tmp(
         self,
@@ -302,30 +339,30 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         old_output = (
-            b"OLD_EXISTING_PDF_CONTENT"
+            b"OLD_EXISTING_PDF"
         )
 
         self.output_pdf.write_bytes(
             old_output
         )
 
-        def failing_pdf_write(
-            page_images,
+        def failing_pdf_save(
+            image_paths,
             output_pdf,
-            dpi,
+            dpi=150,
         ):
             output_pdf = Path(
                 output_pdf
             )
 
-            output_tmp = (
+            temporary = (
                 output_pdf.with_suffix(
                     ".tmp.pdf"
                 )
             )
 
-            output_tmp.write_bytes(
-                b"PARTIAL_NEW_PDF"
+            temporary.write_bytes(
+                b"PARTIAL_PDF_TMP"
             )
 
             raise RuntimeError(
@@ -334,8 +371,10 @@ class PDFIssueRollbackTests(unittest.TestCase):
 
         with patch(
             "pdf_pipeline._save_raster_pdf",
-            side_effect=failing_pdf_write,
+            side_effect=
+                failing_pdf_save,
         ):
+
             with self.assertRaisesRegex(
                 RuntimeError,
                 "forced PDF write failure",
@@ -362,32 +401,30 @@ class PDFIssueRollbackTests(unittest.TestCase):
             self.output_pdf.read_bytes(),
         )
 
-        output_tmp = (
-            self.output_pdf.with_suffix(
-                ".tmp.pdf"
-            )
+        self.assertFalse(
+            self._output_tmp_path().exists()
         )
 
         self.assertFalse(
-            output_tmp.exists()
-        )
-
-        self.assertFalse(
-            self._backup_path(
+            self._output_backup_path(
                 token
             ).exists()
         )
 
-    # ----------------------------------------------------
-    # 3.
-    # PDF已经成功生成，
-    # 但Manifest写入过程中失败。
+        self.assertFalse(
+            self._manifest_path(
+                token
+            ).exists()
+        )
+
+    # ========================================================
+    # 3. Manifest写入失败
     #
-    # 这是之前Web真实出现过的问题所属阶段。
+    # 新PDF已经产生，
+    # 但Manifest没有完成。
     #
-    # 同时让_write_json()留下一个.json.tmp，
-    # 验证rollback能够清理。
-    # ----------------------------------------------------
+    # 必须恢复旧PDF并删除Manifest.tmp。
+    # ========================================================
 
     def test_manifest_write_failure_restores_old_output_and_removes_manifest_tmp(
         self,
@@ -404,17 +441,6 @@ class PDFIssueRollbackTests(unittest.TestCase):
             old_output
         )
 
-        def successful_pdf_write(
-            page_images,
-            output_pdf,
-            dpi,
-        ):
-            Path(
-                output_pdf
-            ).write_bytes(
-                b"NEW_WATERMARKED_PDF"
-            )
-
         def failing_manifest_write(
             path,
             data,
@@ -423,9 +449,11 @@ class PDFIssueRollbackTests(unittest.TestCase):
                 path
             )
 
-            temporary = path.with_suffix(
-                path.suffix
-                + ".tmp"
+            temporary = (
+                path.with_suffix(
+                    path.suffix
+                    + ".tmp"
+                )
             )
 
             temporary.parent.mkdir(
@@ -439,20 +467,24 @@ class PDFIssueRollbackTests(unittest.TestCase):
             )
 
             raise RuntimeError(
-                "forced manifest write failure"
+                "forced PDF manifest failure"
             )
 
         with patch(
             "pdf_pipeline._save_raster_pdf",
-            side_effect=successful_pdf_write,
+            side_effect=
+                self._successful_pdf_save,
         ):
+
             with patch(
                 "pdf_pipeline._write_json",
-                side_effect=failing_manifest_write,
+                side_effect=
+                    failing_manifest_write,
             ):
+
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "forced manifest write failure",
+                    "forced PDF manifest failure",
                 ):
                     self._embed(
                         token,
@@ -467,17 +499,11 @@ class PDFIssueRollbackTests(unittest.TestCase):
             token
         )
 
-        # 原来的PDF必须恢复。
-        self.assertTrue(
-            self.output_pdf.is_file()
-        )
-
         self.assertEqual(
             old_output,
             self.output_pdf.read_bytes(),
         )
 
-        # 最终Manifest和临时Manifest都不能残留。
         self.assertFalse(
             self._manifest_path(
                 token
@@ -491,20 +517,23 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         self.assertFalse(
-            self._backup_path(
+            self._output_tmp_path().exists()
+        )
+
+        self.assertFalse(
+            self._output_backup_path(
                 token
             ).exists()
         )
 
-    # ----------------------------------------------------
-    # 4.
-    # output PDF和Manifest都已经成功生成，
-    # 但最后attach_issue_artifact()失败。
+    # ========================================================
+    # 4. attach失败
     #
-    # 预期：
-    #   仍然不算提交
-    #   所有本次发行资产回滚
-    # ----------------------------------------------------
+    # output + Manifest都已经生成，
+    # 但Registry COMMIT失败。
+    #
+    # 新发行资产必须全部撤销。
+    # ========================================================
 
     def test_attach_failure_removes_new_output_manifest_and_issue_assets(
         self,
@@ -513,30 +542,25 @@ class PDFIssueRollbackTests(unittest.TestCase):
             "4444444444444444"
         )
 
-        def successful_pdf_write(
-            page_images,
-            output_pdf,
-            dpi,
-        ):
-            Path(
-                output_pdf
-            ).write_bytes(
-                b"NEW_WATERMARKED_PDF"
-            )
-
         with patch(
             "pdf_pipeline._save_raster_pdf",
-            side_effect=successful_pdf_write,
+            side_effect=
+                self._successful_pdf_save,
         ):
+
             with patch(
-                "pdf_pipeline.attach_issue_artifact",
-                side_effect=RuntimeError(
-                    "forced attach failure"
-                ),
+                "pdf_pipeline."
+                "attach_issue_artifact",
+
+                side_effect=
+                    RuntimeError(
+                        "forced PDF attach failure"
+                    ),
             ):
+
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "forced attach failure",
+                    "forced PDF attach failure",
                 ):
                     self._embed(
                         token,
@@ -551,8 +575,6 @@ class PDFIssueRollbackTests(unittest.TestCase):
             token
         )
 
-        # 本次之前没有旧output，
-        # 所以失败以后最终output也应该不存在。
         self.assertFalse(
             self.output_pdf.exists()
         )
@@ -570,18 +592,20 @@ class PDFIssueRollbackTests(unittest.TestCase):
         )
 
         self.assertFalse(
-            self._backup_path(
+            self._output_tmp_path().exists()
+        )
+
+        self.assertFalse(
+            self._output_backup_path(
                 token
             ).exists()
         )
 
-    # ----------------------------------------------------
-    # 5.
-    # rollback执行器自身再发生异常，
-    # 也绝不能覆盖真正导致发行失败的原始异常。
+    # ========================================================
+    # 5. rollback执行器自身失败
     #
-    # 这是“保留原异常”契约。
-    # ----------------------------------------------------
+    # 二次异常绝不能覆盖真正的发行异常。
+    # ========================================================
 
     def test_rollback_failure_does_not_replace_original_exception(
         self,
@@ -592,27 +616,34 @@ class PDFIssueRollbackTests(unittest.TestCase):
 
         with patch(
             "pdf_pipeline._save_raster_pdf",
-            side_effect=RuntimeError(
-                "ORIGINAL_PDF_FAILURE"
-            ),
-        ):
-            with patch(
-                "pdf_pipeline._rollback_pdf_issue_failure",
-                side_effect=RuntimeError(
-                    "SECONDARY_ROLLBACK_FAILURE"
+
+            side_effect=
+                RuntimeError(
+                    "ORIGINAL_PDF_FAILURE"
                 ),
+        ):
+
+            with patch(
+                "pdf_pipeline."
+                "_rollback_pdf_issue_failure",
+
+                side_effect=
+                    RuntimeError(
+                        "SECONDARY_PDF_"
+                        "ROLLBACK_FAILURE"
+                    ),
             ):
+
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "ORIGINAL_PDF_FAILURE",
                 ) as captured:
+
                     self._embed(
                         token,
                         "PDF_ROLLBACK_005",
                     )
 
-        # 原异常仍然是PDF阶段错误，
-        # 而不是rollback错误。
         self.assertEqual(
             "ORIGINAL_PDF_FAILURE",
             str(
@@ -632,28 +663,20 @@ class PDFIssueRollbackTests(unittest.TestCase):
 
         self.assertTrue(
             any(
-                "SECONDARY_ROLLBACK_FAILURE"
+                (
+                    "SECONDARY_PDF_"
+                    "ROLLBACK_FAILURE"
+                )
                 in message
-                for message in diagnostics
+
+                for message
+                in diagnostics
             )
         )
 
-
-    # ----------------------------------------------------
-    # 6.
-    # 正常成功发行：
-    #
-    # attach_issue_artifact() 成功以后即视为 COMMIT。
-    #
-    # 预期：
-    #   Registry issue保留
-    #   artifact字段完整
-    #   issue页面目录保留
-    #   output PDF保留
-    #   Manifest保留
-    #   rollback backup不存在
-    #   所有临时文件不存在
-    # ----------------------------------------------------
+    # ========================================================
+    # 6. 正常COMMIT
+    # ========================================================
 
     def test_successful_issue_commits_artifacts_without_rollback(
         self,
@@ -666,20 +689,45 @@ class PDFIssueRollbackTests(unittest.TestCase):
             "PDF_COMMIT_001"
         )
 
-        manifest_path, manifest = (
-            self._embed(
+        # ----------------------------------------------------
+        # 同时验证：
+        # 已有旧output时，成功COMMIT后backup会被清理。
+        # ----------------------------------------------------
+
+        self.output_pdf.write_bytes(
+            b"OLD_PDF_TO_REPLACE"
+        )
+
+        with patch(
+            "pdf_pipeline._save_raster_pdf",
+            side_effect=
+                self._successful_pdf_save,
+        ):
+
+            (
+                manifest_path,
+                manifest,
+            ) = self._embed(
                 token,
                 watermark_number,
             )
-        )
 
         manifest_path = Path(
             manifest_path
         )
 
-        # ------------------------------------------------
-        # 1. 返回结果必须属于本次发行。
-        # ------------------------------------------------
+        self.assertTrue(
+            self.output_pdf.is_file()
+        )
+
+        self.assertEqual(
+            b"NEW_WATERMARKED_PDF",
+            self.output_pdf.read_bytes(),
+        )
+
+        self.assertTrue(
+            manifest_path.is_file()
+        )
 
         self.assertEqual(
             token,
@@ -695,41 +743,9 @@ class PDFIssueRollbackTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(
-            self._manifest_path(
-                token
-            ).resolve(),
-            manifest_path.resolve(),
-        )
-
-        # ------------------------------------------------
-        # 2. 最终输出文件必须存在。
-        # ------------------------------------------------
-
-        self.assertTrue(
-            self.output_pdf.is_file()
-        )
-
-        self.assertGreater(
-            self.output_pdf.stat().st_size,
-            0,
-        )
-
-        self.assertTrue(
-            manifest_path.is_file()
-        )
-
-        self.assertGreater(
-            manifest_path.stat().st_size,
-            0,
-        )
-
-        # ------------------------------------------------
-        # 3. 本次issue页面目录必须保留。
-        #
-        # 成功提交以后这些页面属于正式发行资产，
-        # 绝不能被rollback删除。
-        # ------------------------------------------------
+        # ----------------------------------------------------
+        # issue页面在成功COMMIT后必须保留。
+        # ----------------------------------------------------
 
         issue_dir = (
             self._issue_dir(
@@ -751,9 +767,9 @@ class PDFIssueRollbackTests(unittest.TestCase):
             watermarked_pages
         )
 
-        # ------------------------------------------------
-        # 4. Registry issue必须仍然存在。
-        # ------------------------------------------------
+        # ----------------------------------------------------
+        # Registry artifact完整。
+        # ----------------------------------------------------
 
         registry = load_document_registry(
             self.registry_path
@@ -784,26 +800,12 @@ class PDFIssueRollbackTests(unittest.TestCase):
             ),
         )
 
-        # ------------------------------------------------
-        # 5. attach_issue_artifact() 必须已经真正写入
-        #    artifact元数据。
-        # ------------------------------------------------
-
         self.assertEqual(
             str(
                 self.output_pdf.resolve()
             ),
             issue.get(
                 "output_path"
-            ),
-        )
-
-        self.assertEqual(
-            str(
-                self.output_pdf.resolve()
-            ),
-            issue.get(
-                "output_pdf"
             ),
         )
 
@@ -823,12 +825,6 @@ class PDFIssueRollbackTests(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(
-            issue.get(
-                "output_sha256"
-            )
-        )
-
         self.assertEqual(
             sha256_file(
                 self.output_pdf
@@ -838,18 +834,18 @@ class PDFIssueRollbackTests(unittest.TestCase):
             ),
         )
 
-        # ------------------------------------------------
-        # 6. 成功发行以后不应残留事务临时文件。
-        # ------------------------------------------------
+        # ----------------------------------------------------
+        # 所有事务临时文件都应该消失。
+        # ----------------------------------------------------
 
-        output_tmp = (
-            self.output_pdf.with_suffix(
-                ".tmp.pdf"
-            )
+        self.assertFalse(
+            self._output_tmp_path().exists()
         )
 
         self.assertFalse(
-            output_tmp.exists()
+            self._output_backup_path(
+                token
+            ).exists()
         )
 
         self.assertFalse(
@@ -857,13 +853,6 @@ class PDFIssueRollbackTests(unittest.TestCase):
                 token
             ).exists()
         )
-
-        self.assertFalse(
-            self._backup_path(
-                token
-            ).exists()
-        )
-
 
 
 if __name__ == "__main__":
