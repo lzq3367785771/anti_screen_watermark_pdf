@@ -29,6 +29,7 @@ from document_registry import (
     decode_document_soft_scores,
     derive_page_key,
     load_document_registry,
+    rollback_unattached_issue,
     score_registered_tokens,
     sha256_file,
 )
@@ -164,6 +165,220 @@ def _save_raster_pdf(page_images, output_pdf, dpi):
         for page in pil_pages:
             page.close()
 
+def _rollback_pdf_issue_failure(
+    registry_path,
+    issue_context,
+    output_pdf=None,
+    output_pdf_owned=False,
+    output_tmp_owned=False,
+    output_backup=None,
+    manifest_path=None,
+    manifest_owned=False,
+):
+    """Best-effort rollback for one uncommitted PDF issuance.
+
+    Registry rollback is attempted first.
+
+    Files are cleaned only after the Registry issue is confirmed
+    to be unattached and successfully removed (or already absent).
+
+    Every filesystem deletion requires explicit ownership from the
+    caller. Pre-existing output, temporary or manifest files must
+    never be removed merely because their paths exist.
+
+    Cleanup failures are returned as diagnostic strings and never
+    replace the original issuance exception.
+    """
+    diagnostics = []
+
+    context = (
+        issue_context
+        if isinstance(issue_context, dict)
+        else {}
+    )
+
+    # --------------------------------------------------------
+    # 1. 如果本次调用根本没有成功创建 issue，
+    #    就绝不能碰 Registry 或 issue 目录。
+    # --------------------------------------------------------
+
+    if not context.get(
+        "issue_created"
+    ):
+        return diagnostics
+
+    token = context.get(
+        "trace_token"
+    )
+
+    if not token:
+        diagnostics.append(
+            "issue_created=True，但缺少trace_token"
+        )
+        return diagnostics
+
+    # --------------------------------------------------------
+    # 2. Registry 必须优先回滚。
+    #
+    # 如果 Registry 回滚失败，后面的发行资产全部保留。
+    # 这是保守策略：
+    #
+    #   宁可留下孤儿文件
+    #   也不能留下 active issue 却把文件删掉。
+    # --------------------------------------------------------
+
+    try:
+        rollback_unattached_issue(
+            registry_path,
+            token,
+        )
+
+    except Exception as exc:
+        diagnostics.append(
+            "Registry回滚失败: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        return diagnostics
+
+    # --------------------------------------------------------
+    # 3. 只有明确属于本次发行的 issue 页面目录才能删除。
+    # --------------------------------------------------------
+
+    if context.get(
+        "issue_page_dir_created"
+    ):
+        issue_page_dir = context.get(
+            "issue_page_dir"
+        )
+
+        if issue_page_dir is not None:
+            try:
+                issue_page_dir = Path(
+                    issue_page_dir
+                )
+
+                if issue_page_dir.exists():
+                    shutil.rmtree(
+                        issue_page_dir
+                    )
+
+            except Exception as exc:
+                diagnostics.append(
+                    "issue页面目录清理失败: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # 4. Manifest 只在明确由本次发行创建时删除。
+    # --------------------------------------------------------
+
+    if (
+        manifest_owned
+        and manifest_path is not None
+    ):
+        try:
+            manifest_path = Path(
+                manifest_path
+            )
+
+            if manifest_path.is_file():
+                manifest_path.unlink()
+
+            manifest_tmp = (
+                manifest_path.with_suffix(
+                    manifest_path.suffix
+                    + ".tmp"
+                )
+            )
+
+            if manifest_tmp.is_file():
+                manifest_tmp.unlink()
+
+        except Exception as exc:
+            diagnostics.append(
+                "Manifest清理失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # --------------------------------------------------------
+    # 5. PDF 输出恢复/删除。
+    #
+    # 两种情况：
+    #
+    # A. 原来不存在：
+    #    本次创建失败后直接删除。
+    #
+    # B. 原来已经存在：
+    #    后续会使用 output_backup 保存旧文件，
+    #    回滚时恢复旧版本。
+    # --------------------------------------------------------
+
+    if output_pdf is not None:
+        output_pdf = Path(
+            output_pdf
+        )
+
+        try:
+            if (
+                output_backup is not None
+                and Path(
+                    output_backup
+                ).is_file()
+            ):
+                Path(
+                    output_backup
+                ).replace(
+                    output_pdf
+                )
+
+            elif output_pdf_owned:
+                if output_pdf.is_file():
+                    output_pdf.unlink()
+
+        except Exception as exc:
+            diagnostics.append(
+                "PDF输出恢复/清理失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+                # ----------------------------------------------------
+        # _save_raster_pdf() 使用的临时文件名固定为：
+        #
+        #     <output>.tmp.pdf
+        #
+        # 只有上层在写入前确认该路径不存在，并明确设置
+        # output_tmp_owned=True 后，才允许这里删除。
+        #
+        # 这样不会误删历史崩溃留下的旧临时文件。
+        # ----------------------------------------------------
+
+        if output_tmp_owned:
+            try:
+                output_tmp = (
+                    output_pdf.with_suffix(
+                        ".tmp.pdf"
+                    )
+                )
+
+                if output_tmp.is_file():
+                    output_tmp.unlink()
+
+            except Exception as exc:
+                diagnostics.append(
+                    "PDF临时文件清理失败: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # 6. 如果 backup 仍存在，说明前面的恢复没有消费它。
+    #
+    # 这里不自动删除：
+    # 它可能是唯一剩下的旧输出副本。
+    # --------------------------------------------------------
+
+    return diagnostics
+
 
 def embed_document_pdf(
     input_pdf,
@@ -188,6 +403,16 @@ def embed_document_pdf(
     started = time.perf_counter()
     input_pdf = Path(input_pdf).resolve()
     registry_path = Path(registry_path).resolve()
+
+    if output_pdf is None:
+        raise ValueError(
+            "必须指定PDF输出路径output_pdf"
+        )
+
+    output_pdf = Path(
+        output_pdf
+    ).resolve()
+
     source_sha256 = sha256_file(input_pdf)
     provisional_document_id = source_sha256[:24]
     if assets_root is None:
@@ -224,124 +449,328 @@ def embed_document_pdf(
             float(first_shape[0]) * 72.0 / float(dpi),
         ]
 
-        carrier = issue_watermarked_pages(
-            source_path=input_pdf,
-            registry_path=registry_path,
-            page_records=page_records,
-            dpi=dpi,
-            media_box_points=media_box,
-            document_assets=document_assets,
-            key=key,
-            key_id=_key_id(key),
-            alpha=alpha,
-            repeat=repeat,
-            pilot_bits=pilot_bits,
-            pilot_repeat=pilot_repeat,
-            pilot_alpha=pilot_alpha,
-            recipient=recipient,
-            session=session,
-            notes=notes,
-            trace_token=trace_token,
-            watermark_number=watermark_number,
-            source_name=source_name,
-            source_type="pdf",
-            render_unit_type="page",
-        )
 
-        document_id = carrier[
-            "document_id"
-        ]
+        # ----------------------------------------------------
+        # PDF发行事务状态
+        # ----------------------------------------------------
 
-        document = carrier[
-            "document"
-        ]
+        issue_context = {}
 
-        issue = carrier[
-            "issue"
-        ]
+        output_pdf_owned = False
+        output_tmp_owned = False
+        output_backup = None
 
-        token = carrier[
-            "trace_token"
-        ]
+        manifest_path = None
+        manifest_owned = False
 
-        payload = carrier[
-            "encoded_bits"
-        ]
+        committed = False
 
-        embedded_pages = carrier[
-            "embedded_pages"
-        ]
+        try:
 
-        manifest_pages = carrier[
-            "manifest_pages"
-        ]
+            carrier = issue_watermarked_pages(
+                source_path=input_pdf,
+                registry_path=registry_path,
+                page_records=page_records,
+                dpi=dpi,
+                media_box_points=media_box,
+                document_assets=document_assets,
+                key=key,
+                key_id=_key_id(key),
+                alpha=alpha,
+                repeat=repeat,
+                pilot_bits=pilot_bits,
+                pilot_repeat=pilot_repeat,
+                pilot_alpha=pilot_alpha,
+                recipient=recipient,
+                session=session,
+                notes=notes,
+                trace_token=trace_token,
+                watermark_number=watermark_number,
+                source_name=source_name,
+                source_type="pdf",
+                render_unit_type="page",
+                issue_context=issue_context,
+            )
+
+            document_id = carrier[
+                "document_id"
+            ]
+
+            document = carrier[
+                "document"
+            ]
+
+            issue = carrier[
+                "issue"
+            ]
+
+            token = carrier[
+                "trace_token"
+            ]
+
+            payload = carrier[
+                "encoded_bits"
+            ]
+
+            embedded_pages = carrier[
+                "embedded_pages"
+            ]
+
+            manifest_pages = carrier[
+                "manifest_pages"
+            ]
 
 
-        _save_raster_pdf(embedded_pages, output_pdf, dpi=dpi)
-        manifest = {
-            "schema_version": MANIFEST_SCHEMA_VERSION,
-            "created_at": _now_iso(),
-            "watermark_version": DOCUMENT_WATERMARK_VERSION,
-            "source_pdf": str(input_pdf),
-            "source_sha256": source_sha256,
-            "output_pdf": str(output_pdf),
-            "output_sha256": sha256_file(output_pdf),
-            "document_id": document_id,
-            "page_count": len(page_records),
-            "dpi": int(dpi),
-            "media_box_points": media_box,
-            "trace_id": issue["trace_id"],
-            "trace_token": token,
-            "watermark_number": issue.get("watermark_number"),
-            "encoded_bits": [int(bit) for bit in payload],
-            "key_id": _key_id(key),
-            "watermark": {
-                "block_size": 8,
-                "bit_count": DOCUMENT_CODEWORD_BITS,
-                "alpha": float(alpha),
-                "repeat": int(repeat),
-                "adaptive_alpha": True,
-                "sync_pilot": {
-                    "enabled": True,
-                    "version": "pn64-v1",
-                    "bit_count": int(pilot_bits),
-                    "repeat": int(pilot_repeat),
-                    "alpha": float(pilot_alpha),
-                    "position_offset": DOCUMENT_CODEWORD_BITS * int(repeat),
+
+            # ------------------------------------------------
+            # 准备最终PDF输出路径
+            # ------------------------------------------------
+
+            output_tmp = (
+                output_pdf.with_suffix(
+                    ".tmp.pdf"
+                )
+            )
+
+            # _save_raster_pdf() 会使用固定的 .tmp.pdf。
+            #
+            # 如果调用开始前这个路径已经存在，
+            # 我们没有所有权，不能覆盖，也不能删除。
+            if output_tmp.exists():
+                raise FileExistsError(
+                    "PDF临时输出文件已存在，"
+                    "拒绝覆盖未知历史文件: "
+                    f"{output_tmp}"
+                )
+
+            # 从这一刻开始，如果 .tmp.pdf 出现，
+            # 就可以确认它属于本次发行。
+            output_tmp_owned = True
+
+            # ------------------------------------------------
+            # 如果最终输出PDF已经存在，先保存旧版本。
+            # ------------------------------------------------
+
+            if output_pdf.exists():
+
+                if not output_pdf.is_file():
+                    raise FileExistsError(
+                        "PDF输出路径已存在且不是文件: "
+                        f"{output_pdf}"
+                    )
+
+                output_backup = (
+                    output_pdf.with_name(
+                        output_pdf.name
+                        + "."
+                        + token
+                        + ".rollback.bak"
+                    )
+                )
+
+                if output_backup.exists():
+                    raise FileExistsError(
+                        "PDF回滚备份文件已存在，"
+                        "拒绝覆盖未知历史文件: "
+                        f"{output_backup}"
+                    )
+
+                output_pdf.replace(
+                    output_backup
+                )
+
+            # 如果后面的PDF生成产生最终 output_pdf，
+            # 那么它一定属于本次发行。
+            output_pdf_owned = True
+
+
+
+            _save_raster_pdf(embedded_pages, output_pdf, dpi=dpi)
+
+            # ------------------------------------------------
+            # 本次TraceToken独占自己的Manifest路径。
+            # ------------------------------------------------
+
+            manifest_path = (
+                document_assets
+                / f"manifest_{token}.json"
+            ).resolve()
+
+            manifest_tmp = (
+                manifest_path.with_suffix(
+                    manifest_path.suffix
+                    + ".tmp"
+                )
+            )
+
+            # final 和 tmp 只要任意一个在本次发行前存在，
+            # 就不能声称拥有它。
+            if manifest_path.exists():
+                raise FileExistsError(
+                    "Manifest文件已存在，"
+                    "拒绝覆盖未知历史文件: "
+                    f"{manifest_path}"
+                )
+
+            if manifest_tmp.exists():
+                raise FileExistsError(
+                    "Manifest临时文件已存在，"
+                    "拒绝覆盖未知历史文件: "
+                    f"{manifest_tmp}"
+                )
+
+            # 从这里开始，如果 final/tmp 出现，
+            # 都必定是本次 _write_json() 创建的。
+            manifest_owned = True
+
+            manifest = {
+                "schema_version": MANIFEST_SCHEMA_VERSION,
+                "created_at": _now_iso(),
+                "watermark_version": DOCUMENT_WATERMARK_VERSION,
+                "source_pdf": str(input_pdf),
+                "source_sha256": source_sha256,
+                "output_pdf": str(output_pdf),
+                "output_sha256": sha256_file(output_pdf),
+                "document_id": document_id,
+                "page_count": len(page_records),
+                "dpi": int(dpi),
+                "media_box_points": media_box,
+                "trace_id": issue["trace_id"],
+                "trace_token": token,
+                "watermark_number": issue.get("watermark_number"),
+                "encoded_bits": [int(bit) for bit in payload],
+                "key_id": _key_id(key),
+                "watermark": {
+                    "block_size": 8,
+                    "bit_count": DOCUMENT_CODEWORD_BITS,
+                    "alpha": float(alpha),
+                    "repeat": int(repeat),
+                    "adaptive_alpha": True,
+                    "sync_pilot": {
+                        "enabled": True,
+                        "version": "pn64-v1",
+                        "bit_count": int(pilot_bits),
+                        "repeat": int(pilot_repeat),
+                        "alpha": float(pilot_alpha),
+                        "position_offset": DOCUMENT_CODEWORD_BITS * int(repeat),
+                    },
                 },
-            },
-            "pages": manifest_pages,
-            "render_warnings": (
-                render_warnings.splitlines()
-                if render_warnings
-                else []
-            ),
-            "elapsed_ms": (
-                time.perf_counter()
-                - started
-            ) * 1000.0,
-        }
+                "pages": manifest_pages,
+                "render_warnings": (
+                    render_warnings.splitlines()
+                    if render_warnings
+                    else []
+                ),
+                "elapsed_ms": (
+                    time.perf_counter()
+                    - started
+                ) * 1000.0,
+            }
 
-        # 每一次水印发行都有独立 TraceToken，因此 Manifest
-        # 也必须使用独立文件名，避免同一源文档多次发行时互相覆盖。
-        manifest_path = (
-            document_assets
-            / f"manifest_{token}.json"
-        ).resolve()
+            # 每一次水印发行都有独立 TraceToken，因此 Manifest
+            # 也必须使用独立文件名，避免同一源文档多次发行时互相覆盖。
 
-        _write_json(
-            manifest_path,
-            manifest,
-        )
+            _write_json(
+                manifest_path,
+                manifest,
+            )
 
-        attach_issue_artifact(
-            registry_path,
-            token,
-            output_pdf,
-            manifest_path,
-        )
+            attach_issue_artifact(
+                registry_path,
+                token,
+                output_pdf,
+                manifest_path,
+            )
 
-        return manifest_path, manifest
+            # ------------------------------------------------
+            # 逻辑提交点：
+            #
+            # Registry 已经正式关联 output + manifest。
+            # 从这一行以后不得执行发行回滚。
+            # ------------------------------------------------
+
+            committed = True
+            # ------------------------------------------------
+            # 提交成功后，旧PDF回滚备份已经不再需要。
+            #
+            # 删除失败不能把一次已经成功提交的发行
+            # 重新变成失败。
+            # ------------------------------------------------
+
+            if (
+                output_backup is not None
+                and output_backup.is_file()
+            ):
+                try:
+                    output_backup.unlink()
+
+                except OSError:
+                    pass
+
+            return manifest_path, manifest
+
+        except Exception as exc:
+
+            # ------------------------------------------------
+            # attach成功以后已经提交。
+            #
+            # 理论上目前 committed=True 后只有
+            # best-effort backup cleanup 和 return，
+            # 但这里仍保留防线，禁止误回滚已提交发行。
+            # ------------------------------------------------
+
+            if committed:
+                raise
+
+            rollback_diagnostics = []
+
+            try:
+                rollback_diagnostics = (
+                    _rollback_pdf_issue_failure(
+                        registry_path=registry_path,
+                        issue_context=issue_context,
+                        output_pdf=output_pdf,
+                        output_pdf_owned=
+                            output_pdf_owned,
+                        output_tmp_owned=
+                            output_tmp_owned,
+                        output_backup=
+                            output_backup,
+                        manifest_path=
+                            manifest_path,
+                        manifest_owned=
+                            manifest_owned,
+                    )
+                )
+
+            except Exception as rollback_exc:
+                # 回滚自身即使出现意外异常，
+                # 也不能覆盖真正导致发行失败的原始异常。
+                rollback_diagnostics = [
+                    (
+                        "PDF回滚执行器异常: "
+                        f"{type(rollback_exc).__name__}: "
+                        f"{rollback_exc}"
+                    )
+                ]
+
+            # 将诊断附着到原异常对象上。
+            #
+            # 不修改原始异常类型和原始错误消息。
+            if rollback_diagnostics:
+                try:
+                    setattr(
+                        exc,
+                        "rollback_diagnostics",
+                        rollback_diagnostics,
+                    )
+
+                except Exception:
+                    pass
+
+            # 这里必须使用裸 raise，
+            # 才会重新抛出原始异常及其原 traceback。
+            raise
 
 
 def aggregate_trimmed_repeat_scores(details, trim_ratio=0.20):
