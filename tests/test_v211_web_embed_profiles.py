@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from web_demo.server import (
+    DOCUMENT_EMBED_PROFILES,
     DemoConfig,
     make_request_handler,
 )
@@ -36,12 +37,12 @@ class WebEmbedProfileTests(unittest.TestCase):
                 / "reports"
             ),
 
-            pdf_input_dir=(
+            document_input_dir=(
                 self.root
                 / "document_inputs"
             ),
 
-            pdf_output_dir=(
+            document_output_dir=(
                 self.root
                 / "document_outputs"
             ),
@@ -78,7 +79,7 @@ class WebEmbedProfileTests(unittest.TestCase):
     # _handle_embed()实际只需要：
     #
     #   self.headers
-    #   self._receive_pdf()
+    #   self._receive_document()
     #   self._send_json()
     # --------------------------------------------------------
 
@@ -129,10 +130,9 @@ class WebEmbedProfileTests(unittest.TestCase):
                     request_id,
             })
 
-        handler._receive_pdf = (
+        handler._receive_document = (
             fake_receive
         )
-
         handler._send_json = (
             fake_send_json
         )
@@ -636,6 +636,160 @@ class WebEmbedProfileTests(unittest.TestCase):
                 "payload_alpha"
             ],
         )
+
+
+    def test_registered_pdf_reuses_canonical_dpi(
+        self,
+    ):
+
+        source = (
+            self.root
+            / "legacy.pdf"
+        )
+
+        source.write_bytes(
+            b"%PDF-1.4\n"
+            b"% legacy canonical dpi test\n"
+        )
+
+        (
+            handler,
+            responses,
+        ) = self._make_handler(
+            source
+        )
+
+        manifest_path = (
+            self.root
+            / "manifest_legacy_pdf.json"
+        )
+
+        manifest = {
+            "trace_token":
+                "3333333333333333",
+
+            "trace_id":
+                "e" * 32,
+
+            "document_id":
+                "f" * 24,
+
+            "page_count":
+                1,
+
+            "render_unit_type":
+                "page",
+
+            "dpi":
+                96,
+
+            "watermark": {
+                "block_size":
+                    8,
+
+                "repeat":
+                    16,
+
+                "alpha":
+                    42.0,
+            },
+        }
+
+        with patch(
+            "web_demo.server."
+            "load_registered_reference_set",
+            return_value={
+                "dpi": 96,
+                "source_type": "pdf",
+            },
+        ) as mocked_reference, patch(
+            "web_demo.server."
+            "embed_document"
+        ) as mocked_embed:
+
+            mocked_embed.return_value = (
+                manifest_path,
+                manifest,
+            )
+
+            handler._handle_embed(
+                "request-legacy-pdf-001"
+            )
+
+        mocked_reference.assert_called_once()
+
+        mocked_embed.assert_called_once()
+
+        kwargs = (
+            mocked_embed
+            .call_args
+            .kwargs
+        )
+
+        # 已登记旧PDF必须沿用Canonical 96 DPI。
+        self.assertEqual(
+            96,
+            kwargs[
+                "dpi"
+            ],
+        )
+
+        # 但其余PDF Profile仍然使用PDF参数。
+        self.assertEqual(
+            42.0,
+            kwargs[
+                "alpha"
+            ],
+        )
+
+        self.assertEqual(
+            16,
+            kwargs[
+                "repeat"
+            ],
+        )
+
+        self.assertEqual(
+            6,
+            kwargs[
+                "pilot_repeat"
+            ],
+        )
+
+        self.assertEqual(
+            78.0,
+            kwargs[
+                "pilot_alpha"
+            ],
+        )
+
+        # 最重要：
+        # 本次兼容不能污染全局PDF默认Profile。
+        self.assertEqual(
+            150,
+            DOCUMENT_EMBED_PROFILES[
+                "pdf"
+            ][
+                "dpi"
+            ],
+        )
+
+        self.assertEqual(
+            1,
+            len(
+                responses
+            ),
+        )
+
+        self.assertEqual(
+            HTTPStatus.OK,
+            responses[0][
+                "status"
+            ],
+        )
+
+
+
 
 
 if __name__ == "__main__":
