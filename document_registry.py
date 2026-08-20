@@ -365,6 +365,266 @@ def register_document(
 
     return document_id, record
 
+
+def load_registered_reference_set(
+    registry_path,
+    document_id,
+    expected_source_type=None,
+    expected_dpi=None,
+):
+    """Load and validate one reusable canonical reference set.
+
+    Returns
+    -------
+    dict or None
+        已登记且验证完整的Document记录。
+
+        如果document_id尚未登记，返回None。
+
+    Notes
+    -----
+    该函数是只读检查，不修改Registry，也不修改参考文件。
+
+    已登记Document一旦作为Canonical Reference使用，
+    reference_path / reference_sha256 / dpi必须保持一致。
+    """
+
+    normalized_document_id = (
+        str(document_id)
+        .strip()
+        .lower()
+    )
+
+    registry = load_document_registry(
+        registry_path
+    )
+
+    document = registry[
+        "documents"
+    ].get(
+        normalized_document_id
+    )
+
+    if document is None:
+        return None
+
+    if (
+        document.get(
+            "status"
+        )
+        != "active"
+    ):
+        raise ValueError(
+            "已登记Document不是active状态: "
+            f"{normalized_document_id}"
+        )
+
+    # ----------------------------------------------------
+    # Source Type检查
+    # ----------------------------------------------------
+
+    if expected_source_type is not None:
+
+        expected_type = (
+            str(expected_source_type)
+            .strip()
+            .lower()
+        )
+
+        actual_type = (
+            str(
+                document.get(
+                    "source_type"
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        if actual_type != expected_type:
+            raise ValueError(
+                "已登记Document的source_type不匹配: "
+                f"expected={expected_type}, "
+                f"actual={actual_type}"
+            )
+
+    # ----------------------------------------------------
+    # Canonical DPI检查
+    #
+    # 同一个document_id一旦建立参考几何，
+    # 后续发行不能偷偷换DPI。
+    # ----------------------------------------------------
+
+    if expected_dpi is not None:
+
+        actual_dpi = document.get(
+            "dpi"
+        )
+
+        if actual_dpi is None:
+            raise ValueError(
+                "已登记Document缺少dpi"
+            )
+
+        if int(actual_dpi) != int(
+            expected_dpi
+        ):
+            raise ValueError(
+                "同一Document不能更换Canonical DPI: "
+                f"registered={int(actual_dpi)}, "
+                f"requested={int(expected_dpi)}"
+            )
+
+    # ----------------------------------------------------
+    # Pages完整性检查
+    # ----------------------------------------------------
+
+    pages = document.get(
+        "pages"
+    )
+
+    if (
+        not isinstance(
+            pages,
+            list,
+        )
+        or not pages
+    ):
+        raise ValueError(
+            "已登记Document没有有效pages"
+        )
+
+    page_count = document.get(
+        "page_count"
+    )
+
+    if page_count is None:
+        raise ValueError(
+            "已登记Document缺少page_count"
+        )
+
+    if int(page_count) != len(
+        pages
+    ):
+        raise ValueError(
+            "Document page_count与pages数量不一致"
+        )
+
+    validated_pages = []
+
+    for fallback_index, page in enumerate(
+        pages,
+        start=1,
+    ):
+
+        if not isinstance(
+            page,
+            dict,
+        ):
+            raise ValueError(
+                "Document pages中存在非法记录"
+            )
+
+        reference_path_value = (
+            page.get(
+                "reference_path"
+            )
+        )
+
+        if not reference_path_value:
+            raise ValueError(
+                "参考页面缺少reference_path: "
+                f"page={fallback_index}"
+            )
+
+        reference_path = Path(
+            reference_path_value
+        ).resolve()
+
+        if not reference_path.is_file():
+            raise FileNotFoundError(
+                "Canonical Reference页面不存在: "
+                f"{reference_path}"
+            )
+
+        expected_sha256 = (
+            str(
+                page.get(
+                    "reference_sha256"
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        if not expected_sha256:
+            raise ValueError(
+                "参考页面缺少reference_sha256: "
+                f"{reference_path}"
+            )
+
+        actual_sha256 = (
+            sha256_file(
+                reference_path
+            )
+            .strip()
+            .lower()
+        )
+
+        if (
+            actual_sha256
+            != expected_sha256
+        ):
+            raise ValueError(
+                "Canonical Reference页面SHA256不匹配: "
+                f"{reference_path}"
+            )
+
+        width = page.get(
+            "width"
+        )
+
+        height = page.get(
+            "height"
+        )
+
+        if (
+            width is None
+            or height is None
+            or int(width) <= 0
+            or int(height) <= 0
+        ):
+            raise ValueError(
+                "Canonical Reference页面尺寸非法: "
+                f"{reference_path}"
+            )
+
+        validated_page = dict(
+            page
+        )
+
+        validated_page[
+            "reference_path"
+        ] = str(
+            reference_path
+        )
+
+        validated_pages.append(
+            validated_page
+        )
+
+    result = dict(
+        document
+    )
+
+    result[
+        "pages"
+    ] = validated_pages
+
+    return result
+
 def issue_document_trace(
     registry_path,
     document_id,
