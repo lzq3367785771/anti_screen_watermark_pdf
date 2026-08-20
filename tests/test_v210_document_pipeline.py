@@ -25,7 +25,7 @@ class DocumentPipelineTests(unittest.TestCase):
 
         self.assertEqual(
             DOCUMENT_PIPELINE_VERSION,
-            "v2.1.0",
+            "v2.1.1",
         )
 
 
