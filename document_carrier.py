@@ -192,6 +192,7 @@ def issue_watermarked_pages(
     source_name=None,
     source_type=None,
     render_unit_type=None,
+    issue_context=None
 ):
     """对已经渲染好的页面执行统一水印发行。
 
@@ -209,8 +210,29 @@ def issue_watermarked_pages(
             reference_path
             reference_sha256
 
-    document_assets:
+        document_assets:
         当前document_id对应的资源目录。
+
+    issue_context:
+        可选的发行事务上下文字典。
+
+        如果提供，函数会在 issue_document_trace()
+        成功创建 Registry issue 后立即写入：
+            issue_created
+            trace_token
+            document_id
+            issue
+
+        在 issue 页面目录处理阶段还会写入：
+            issue_page_dir
+            issue_page_dir_created
+
+        只有当前调用成功创建了新的 token 专属目录时，
+        issue_page_dir_created 才为 True。
+
+        即使后续页面嵌入失败且函数没有正常返回，
+        上层 Adapter 仍可利用这些信息安全回滚
+        本次尚未 attach artifact 的 issue。
 
     Returns
     -------
@@ -230,6 +252,33 @@ def issue_watermarked_pages(
     document_assets = Path(
         document_assets
     ).resolve()
+
+    # --------------------------------------------------------
+    # 本次发行的事务上下文
+    #
+    # 上层 Adapter 可以传入一个 dict。
+    # 一旦 issue_document_trace() 真正成功，
+    # Carrier 会立即把本次创建的 TraceToken 写入该字典。
+    #
+    # 因此即使后续页面嵌入发生异常、函数没有 return，
+    # 上层仍然能够准确知道应该回滚哪个 issue。
+    # --------------------------------------------------------
+
+    if issue_context is not None:
+
+        if not isinstance(
+            issue_context,
+            dict,
+        ):
+            raise TypeError(
+                "issue_context必须为dict或None"
+            )
+
+        # 防止调用者错误复用旧 context，
+        # 导致一次早期失败误回滚前一次发行。
+        issue_context.clear()
+
+
 
     if not source_path.is_file():
         raise FileNotFoundError(
@@ -279,6 +328,26 @@ def issue_watermarked_pages(
     ]
 
     # --------------------------------------------------------
+    # issue_document_trace() 已经成功返回。
+    #
+    # 到这一刻才能确认：
+    # 当前 TraceToken 确实由本次调用创建。
+    #
+    # 只有此时才把所有权写入 issue_context。
+    # --------------------------------------------------------
+
+    if issue_context is not None:
+
+        issue_context.update({
+            "issue_created": True,
+            "trace_token": token,
+            "document_id": document_id,
+            "issue": dict(issue),
+        })
+
+
+
+    # --------------------------------------------------------
     # 3. 64 bit TraceToken + CRC16 + Hamming -> 140 bit
     # --------------------------------------------------------
 
@@ -294,6 +363,7 @@ def issue_watermarked_pages(
         )
 
     # --------------------------------------------------------
+        # --------------------------------------------------------
     # 4. 当前发行版本的水印页面保存位置
     # --------------------------------------------------------
 
@@ -303,10 +373,39 @@ def issue_watermarked_pages(
         / token
     )
 
+    if issue_context is not None:
+        issue_context[
+            "issue_page_dir"
+        ] = issue_page_dir
+
+        # 在真正创建目录之前先明确标记：
+        # 当前调用尚未拥有这个目录。
+        issue_context[
+            "issue_page_dir_created"
+        ] = False
+
+    # --------------------------------------------------------
+    # 一个 TraceToken 的 issue 目录必须由本次发行独占。
+    #
+    # 如果目录已经存在，它可能是历史失败发行留下的
+    # 孤儿目录，因此不能继续覆盖，也不能在回滚时误删。
+    # --------------------------------------------------------
+
+    if issue_page_dir.exists():
+        raise FileExistsError(
+            "本次发行的issue资源目录已存在: "
+            f"{issue_page_dir}"
+        )
+
     issue_page_dir.mkdir(
         parents=True,
-        exist_ok=True,
+        exist_ok=False,
     )
+
+    if issue_context is not None:
+        issue_context[
+            "issue_page_dir_created"
+        ] = True
 
     embedded_pages = []
     manifest_pages = []
