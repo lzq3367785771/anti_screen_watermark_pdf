@@ -19,7 +19,7 @@ from document_registry import infer_source_type
 from pdf_pipeline import DEFAULT_KEY, embed_document_pdf
 from pptx_pipeline import embed_document_pptx
 
-DOCUMENT_PIPELINE_VERSION = "v2.1.0"
+DOCUMENT_PIPELINE_VERSION = "v2.1.1"
 
 SUPPORTED_SOURCE_TYPES = {
     "pdf",
@@ -76,13 +76,17 @@ def embed_document(
     source_name=None,
     source_type=None,
 ):
+
     """统一文档水印发行入口。
 
-    V2.1.0 当前只真正实现 PDF Adapter。
+    V2.1.1 当前已经实现：
 
-    DOCX / PPTX / XLSX 已能够被识别，但在对应 Office Renderer
-    完成之前会明确返回 NotImplementedError，而不会错误地进入
-    PDF 处理路径。
+        PDF
+        PPTX
+
+    DOCX / XLSX 已能够被识别，但对应的文档渲染/重建 Adapter
+    尚未实现，因此会明确返回 NotImplementedError，而不会错误地
+    进入 PDF 或 PPTX 处理路径。
     """
 
     input_path = Path(input_path).resolve()
@@ -175,6 +179,7 @@ def embed_document(
     # --------------------------------------------------------
 
     raise NotImplementedError(
-        f"{resolved_type.upper()} 文件已经被 V2.1.0 "
-        f"识别，但对应的文档渲染/重建 Adapter 尚未实现"
+        f"{resolved_type.upper()} 文件已经被 "
+        f"{DOCUMENT_PIPELINE_VERSION} 识别，"
+        f"但对应的文档渲染/重建 Adapter 尚未实现"
     )
