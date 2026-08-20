@@ -470,6 +470,40 @@ def attach_issue_artifact(
     return registry["issues"][token]
 
 
+def rollback_unattached_issue(registry_path, trace_token):
+    """Remove one issued trace record that has not attached an artifact."""
+
+    token = normalize_trace_token(trace_token)
+    registry = load_document_registry(registry_path)
+    issue = registry["issues"].get(token)
+
+    if issue is None:
+        return None
+
+    if issue.get("status") != "issued":
+        raise ValueError("只有issued状态的水印记录可以回滚")
+
+    artifact_fields = (
+        "output_path",
+        "output_pdf",
+        "output_sha256",
+        "output_type",
+        "manifest_path",
+    )
+    attached_fields = [
+        field
+        for field in artifact_fields
+        if issue.get(field)
+    ]
+    if attached_fields:
+        raise ValueError("已关联发行文件的水印记录不能回滚")
+
+    removed = dict(issue)
+    del registry["issues"][token]
+    save_document_registry(registry_path, registry)
+    return removed
+
+
 def retire_document_issue(registry_path, trace_token, trash_path=None):
     """Disable one issued watermark while retaining a minimal audit record."""
 
