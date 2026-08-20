@@ -29,6 +29,7 @@ from document_registry import (
     decode_document_soft_scores,
     derive_page_key,
     load_document_registry,
+    load_registered_reference_set,
     rollback_unattached_issue,
     score_registered_tokens,
     sha256_file,
@@ -379,6 +380,378 @@ def _rollback_pdf_issue_failure(
 
     return diagnostics
 
+def _prepare_pdf_reference_set(
+    input_pdf,
+    registry_path,
+    document_assets,
+    document_id,
+    dpi,
+    poppler_bin=None,
+):
+    """Prepare or reuse the canonical PDF reference-page set.
+
+    Existing registered canonical references are reused read-only.
+
+    For a new document, all pages are first written into an owned
+    staging directory. The staging directory is published as
+    reference_pages only after every page has been prepared
+    successfully.
+    """
+
+    input_pdf = Path(
+        input_pdf
+    ).resolve()
+
+    registry_path = Path(
+        registry_path
+    ).resolve()
+
+    document_assets = Path(
+        document_assets
+    ).resolve()
+
+    reference_dir = (
+        document_assets
+        / "reference_pages"
+    )
+
+    # --------------------------------------------------------
+    # 1. 已经登记过Canonical Reference：
+    #
+    #    只读验证并直接复用。
+    #    不再次调用PDF渲染器，也不修改reference_pages。
+    # --------------------------------------------------------
+
+    registered = (
+        load_registered_reference_set(
+            registry_path,
+            document_id,
+            expected_source_type="pdf",
+            expected_dpi=dpi,
+        )
+    )
+
+    if registered is not None:
+
+        media_box = registered.get(
+            "media_box_points"
+        )
+
+        if (
+            not isinstance(
+                media_box,
+                (list, tuple),
+            )
+            or len(media_box) != 2
+        ):
+            raise ValueError(
+                "已登记Document缺少有效media_box_points"
+            )
+
+        return {
+            "reused": True,
+
+            "reference_dir":
+                reference_dir.resolve(),
+
+            "page_records": [
+                dict(page)
+                for page in registered[
+                    "pages"
+                ]
+            ],
+
+            "media_box_points": [
+                float(
+                    media_box[0]
+                ),
+                float(
+                    media_box[1]
+                ),
+            ],
+
+            # 本次没有重新渲染，
+            # 因而没有新的render warning。
+            "render_warnings": "",
+        }
+
+    # --------------------------------------------------------
+    # 2. Registry中没有这个Document。
+    #
+    # 如果正式reference_pages却已经存在，
+    # 我们没有证据证明它属于一个完整可信的Canonical Set。
+    #
+    # 绝不能直接覆盖，也不能自动删除。
+    # --------------------------------------------------------
+
+    if reference_dir.exists():
+        raise FileExistsError(
+            "reference_pages已存在，"
+            "但Registry中没有可验证的Canonical Reference；"
+            "拒绝覆盖未知历史目录: "
+            f"{reference_dir}"
+        )
+
+    document_assets.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # --------------------------------------------------------
+    # 3. 在最终document_assets同一目录下创建staging。
+    #
+    # staging和reference_pages位于同一文件系统，
+    # 最终目录发布可以直接使用rename/replace。
+    # --------------------------------------------------------
+
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=
+                ".reference_pages_staging_",
+            dir=
+                str(
+                    document_assets
+                ),
+        )
+    )
+
+    published = False
+
+    try:
+
+        # ----------------------------------------------------
+        # 4. PDF原始渲染仍然使用独立临时目录。
+        #
+        # Poppler产生的原始图不直接进入Canonical目录。
+        # ----------------------------------------------------
+
+        with tempfile.TemporaryDirectory(
+            prefix=
+                "pdf_v20a_render_"
+        ) as render_temp:
+
+            (
+                rendered,
+                render_warnings,
+            ) = render_pdf_pages(
+                input_pdf,
+                render_temp,
+                dpi=dpi,
+                poppler_bin=poppler_bin,
+            )
+
+            if not rendered:
+                raise ValueError(
+                    "PDF渲染结果为空"
+                )
+
+            staged_records = []
+
+            first_shape = None
+
+            for index, rendered_page in enumerate(
+                rendered,
+                start=1,
+            ):
+
+                image = cv2.imread(
+                    str(
+                        rendered_page
+                    ),
+                    cv2.IMREAD_COLOR,
+                )
+
+                if image is None:
+                    raise RuntimeError(
+                        "无法读取渲染页面: "
+                        f"{rendered_page}"
+                    )
+
+                height, width = (
+                    image.shape[:2]
+                )
+
+                if first_shape is None:
+                    first_shape = (
+                        int(height),
+                        int(width),
+                    )
+
+                staging_target = (
+                    staging_dir
+                    / f"page_{index:03d}.png"
+                )
+
+                if not cv2.imwrite(
+                    str(
+                        staging_target
+                    ),
+                    image,
+                ):
+                    raise RuntimeError(
+                        "无法保存staging参考页面: "
+                        f"{staging_target}"
+                    )
+
+                staged_records.append({
+                    "page_index":
+                        index,
+
+                    "width":
+                        int(width),
+
+                    "height":
+                        int(height),
+
+                    # 这里先只保存文件名。
+                    #
+                    # staging发布以后，Registry记录中必须指向
+                    # 最终reference_pages，而不是staging路径。
+                    "_filename":
+                        staging_target.name,
+
+                    "reference_sha256":
+                        sha256_file(
+                            staging_target
+                        ),
+                })
+
+        if first_shape is None:
+            raise ValueError(
+                "PDF没有可用页面"
+            )
+
+        # ----------------------------------------------------
+        # 5. 在发布之前构造最终Canonical路径。
+        #
+        # 此时这些final路径还不存在，
+        # 但我们已经完成了所有可能失败的页面读写和hash计算。
+        # ----------------------------------------------------
+
+        page_records = []
+
+        for staged_record in staged_records:
+
+            filename = staged_record[
+                "_filename"
+            ]
+
+            final_reference = (
+                reference_dir
+                / filename
+            ).resolve()
+
+            page_records.append({
+                "page_index":
+                    staged_record[
+                        "page_index"
+                    ],
+
+                "width":
+                    staged_record[
+                        "width"
+                    ],
+
+                "height":
+                    staged_record[
+                        "height"
+                    ],
+
+                "reference_path":
+                    str(
+                        final_reference
+                    ),
+
+                "reference_sha256":
+                    staged_record[
+                        "reference_sha256"
+                    ],
+            })
+
+        media_box = [
+            float(
+                first_shape[1]
+            )
+            * 72.0
+            / float(dpi),
+
+            float(
+                first_shape[0]
+            )
+            * 72.0
+            / float(dpi),
+        ]
+
+        # ----------------------------------------------------
+        # 6. 最后再次确认final没有被别人创建。
+        #
+        # 这是从staging开始到现在之间的二次保护。
+        # ----------------------------------------------------
+
+        if reference_dir.exists():
+            raise FileExistsError(
+                "准备发布Canonical Reference时"
+                "reference_pages已经存在: "
+                f"{reference_dir}"
+            )
+
+        # ----------------------------------------------------
+        # 7. 一次性发布整个目录。
+        #
+        # 不再逐个覆盖：
+        #
+        #   page_001
+        #   page_002
+        #   page_003
+        #
+        # 而是：
+        #
+        #   完整 staging directory
+        #             ↓
+        #   reference_pages
+        # ----------------------------------------------------
+
+        staging_dir.replace(
+            reference_dir
+        )
+
+        published = True
+
+        return {
+            "reused": False,
+
+            "reference_dir":
+                reference_dir.resolve(),
+
+            "page_records":
+                page_records,
+
+            "media_box_points":
+                media_box,
+
+            "render_warnings":
+                render_warnings,
+        }
+
+    finally:
+
+        # ----------------------------------------------------
+        # 发布失败：
+        # 只清理我们自己创建的staging。
+        #
+        # 发布成功以后staging路径已经不存在，
+        # 不会碰正式reference_pages。
+        # ----------------------------------------------------
+
+        if (
+            not published
+            and staging_dir.exists()
+        ):
+            shutil.rmtree(
+                staging_dir,
+                ignore_errors=True,
+            )
+
 
 def embed_document_pdf(
     input_pdf,
@@ -418,359 +791,375 @@ def embed_document_pdf(
     if assets_root is None:
         assets_root = input_pdf.parent / ".document_assets"
     document_assets = Path(assets_root).resolve() / provisional_document_id
-    reference_dir = document_assets / "reference_pages"
-    reference_dir.mkdir(parents=True, exist_ok=True)
+    
 
-    with tempfile.TemporaryDirectory(prefix="pdf_v20a_render_") as temporary_dir:
-        rendered, render_warnings = render_pdf_pages(
-            input_pdf, temporary_dir, dpi=dpi, poppler_bin=poppler_bin
+    # ----------------------------------------------------
+    # Canonical Reference
+    #
+    # 已登记且完整：
+    #   直接只读复用。
+    #
+    # 尚未登记：
+    #   先在staging中完整准备，
+    #   再一次性发布reference_pages。
+    # ----------------------------------------------------
+
+    reference = (
+        _prepare_pdf_reference_set(
+            input_pdf=input_pdf,
+            registry_path=registry_path,
+            document_assets=document_assets,
+            document_id=
+                provisional_document_id,
+            dpi=dpi,
+            poppler_bin=poppler_bin,
         )
-        page_records = []
-        first_shape = None
-        for index, rendered_page in enumerate(rendered, 1):
-            image = cv2.imread(str(rendered_page), cv2.IMREAD_COLOR)
-            if image is None:
-                raise RuntimeError(f"无法读取渲染页面: {rendered_page}")
-            height, width = image.shape[:2]
-            first_shape = first_shape or (height, width)
-            target = reference_dir / f"page_{index:03d}.png"
-            if not cv2.imwrite(str(target), image):
-                raise RuntimeError(f"无法保存参考页面: {target}")
-            page_records.append({
-                "page_index": index,
-                "width": width,
-                "height": height,
-                "reference_path": str(target.resolve()),
-                "reference_sha256": sha256_file(target),
-            })
+    )
 
-        media_box = [
-            float(first_shape[1]) * 72.0 / float(dpi),
-            float(first_shape[0]) * 72.0 / float(dpi),
+    page_records = [
+        dict(page)
+        for page
+        in reference[
+            "page_records"
+        ]
+    ]
+
+    media_box = [
+        float(value)
+        for value
+        in reference[
+            "media_box_points"
+        ]
+    ]
+
+    render_warnings = (
+        reference[
+            "render_warnings"
+        ]
+    )
+
+
+    # ----------------------------------------------------
+    # PDF发行事务状态
+    # ----------------------------------------------------
+
+    issue_context = {}
+
+    output_pdf_owned = False
+    output_tmp_owned = False
+    output_backup = None
+
+    manifest_path = None
+    manifest_owned = False
+
+    committed = False
+
+    try:
+
+        carrier = issue_watermarked_pages(
+            source_path=input_pdf,
+            registry_path=registry_path,
+            page_records=page_records,
+            dpi=dpi,
+            media_box_points=media_box,
+            document_assets=document_assets,
+            key=key,
+            key_id=_key_id(key),
+            alpha=alpha,
+            repeat=repeat,
+            pilot_bits=pilot_bits,
+            pilot_repeat=pilot_repeat,
+            pilot_alpha=pilot_alpha,
+            recipient=recipient,
+            session=session,
+            notes=notes,
+            trace_token=trace_token,
+            watermark_number=watermark_number,
+            source_name=source_name,
+            source_type="pdf",
+            render_unit_type="page",
+            issue_context=issue_context,
+        )
+
+        document_id = carrier[
+            "document_id"
+        ]
+
+        document = carrier[
+            "document"
+        ]
+
+        issue = carrier[
+            "issue"
+        ]
+
+        token = carrier[
+            "trace_token"
+        ]
+
+        payload = carrier[
+            "encoded_bits"
+        ]
+
+        embedded_pages = carrier[
+            "embedded_pages"
+        ]
+
+        manifest_pages = carrier[
+            "manifest_pages"
         ]
 
 
-        # ----------------------------------------------------
-        # PDF发行事务状态
-        # ----------------------------------------------------
 
-        issue_context = {}
+        # ------------------------------------------------
+        # 准备最终PDF输出路径
+        # ------------------------------------------------
 
-        output_pdf_owned = False
-        output_tmp_owned = False
-        output_backup = None
+        output_tmp = (
+            output_pdf.with_suffix(
+                ".tmp.pdf"
+            )
+        )
 
-        manifest_path = None
-        manifest_owned = False
+        # _save_raster_pdf() 会使用固定的 .tmp.pdf。
+        #
+        # 如果调用开始前这个路径已经存在，
+        # 我们没有所有权，不能覆盖，也不能删除。
+        if output_tmp.exists():
+            raise FileExistsError(
+                "PDF临时输出文件已存在，"
+                "拒绝覆盖未知历史文件: "
+                f"{output_tmp}"
+            )
 
-        committed = False
+        # 从这一刻开始，如果 .tmp.pdf 出现，
+        # 就可以确认它属于本次发行。
+        output_tmp_owned = True
+
+        # ------------------------------------------------
+        # 如果最终输出PDF已经存在，先保存旧版本。
+        # ------------------------------------------------
+
+        if output_pdf.exists():
+
+            if not output_pdf.is_file():
+                raise FileExistsError(
+                    "PDF输出路径已存在且不是文件: "
+                    f"{output_pdf}"
+                )
+
+            output_backup = (
+                output_pdf.with_name(
+                    output_pdf.name
+                    + "."
+                    + token
+                    + ".rollback.bak"
+                )
+            )
+
+            if output_backup.exists():
+                raise FileExistsError(
+                    "PDF回滚备份文件已存在，"
+                    "拒绝覆盖未知历史文件: "
+                    f"{output_backup}"
+                )
+
+            output_pdf.replace(
+                output_backup
+            )
+
+        # 如果后面的PDF生成产生最终 output_pdf，
+        # 那么它一定属于本次发行。
+        output_pdf_owned = True
+
+
+
+        _save_raster_pdf(embedded_pages, output_pdf, dpi=dpi)
+
+        # ------------------------------------------------
+        # 本次TraceToken独占自己的Manifest路径。
+        # ------------------------------------------------
+
+        manifest_path = (
+            document_assets
+            / f"manifest_{token}.json"
+        ).resolve()
+
+        manifest_tmp = (
+            manifest_path.with_suffix(
+                manifest_path.suffix
+                + ".tmp"
+            )
+        )
+
+        # final 和 tmp 只要任意一个在本次发行前存在，
+        # 就不能声称拥有它。
+        if manifest_path.exists():
+            raise FileExistsError(
+                "Manifest文件已存在，"
+                "拒绝覆盖未知历史文件: "
+                f"{manifest_path}"
+            )
+
+        if manifest_tmp.exists():
+            raise FileExistsError(
+                "Manifest临时文件已存在，"
+                "拒绝覆盖未知历史文件: "
+                f"{manifest_tmp}"
+            )
+
+        # 从这里开始，如果 final/tmp 出现，
+        # 都必定是本次 _write_json() 创建的。
+        manifest_owned = True
+
+        manifest = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "created_at": _now_iso(),
+            "watermark_version": DOCUMENT_WATERMARK_VERSION,
+            "source_pdf": str(input_pdf),
+            "source_sha256": source_sha256,
+            "output_pdf": str(output_pdf),
+            "output_sha256": sha256_file(output_pdf),
+            "document_id": document_id,
+            "page_count": len(page_records),
+            "dpi": int(dpi),
+            "media_box_points": media_box,
+            "trace_id": issue["trace_id"],
+            "trace_token": token,
+            "watermark_number": issue.get("watermark_number"),
+            "encoded_bits": [int(bit) for bit in payload],
+            "key_id": _key_id(key),
+            "watermark": {
+                "block_size": 8,
+                "bit_count": DOCUMENT_CODEWORD_BITS,
+                "alpha": float(alpha),
+                "repeat": int(repeat),
+                "adaptive_alpha": True,
+                "sync_pilot": {
+                    "enabled": True,
+                    "version": "pn64-v1",
+                    "bit_count": int(pilot_bits),
+                    "repeat": int(pilot_repeat),
+                    "alpha": float(pilot_alpha),
+                    "position_offset": DOCUMENT_CODEWORD_BITS * int(repeat),
+                },
+            },
+            "pages": manifest_pages,
+            "render_warnings": (
+                render_warnings.splitlines()
+                if render_warnings
+                else []
+            ),
+            "elapsed_ms": (
+                time.perf_counter()
+                - started
+            ) * 1000.0,
+        }
+
+        # 每一次水印发行都有独立 TraceToken，因此 Manifest
+        # 也必须使用独立文件名，避免同一源文档多次发行时互相覆盖。
+
+        _write_json(
+            manifest_path,
+            manifest,
+        )
+
+        attach_issue_artifact(
+            registry_path,
+            token,
+            output_pdf,
+            manifest_path,
+        )
+
+        # ------------------------------------------------
+        # 逻辑提交点：
+        #
+        # Registry 已经正式关联 output + manifest。
+        # 从这一行以后不得执行发行回滚。
+        # ------------------------------------------------
+
+        committed = True
+        # ------------------------------------------------
+        # 提交成功后，旧PDF回滚备份已经不再需要。
+        #
+        # 删除失败不能把一次已经成功提交的发行
+        # 重新变成失败。
+        # ------------------------------------------------
+
+        if (
+            output_backup is not None
+            and output_backup.is_file()
+        ):
+            try:
+                output_backup.unlink()
+
+            except OSError:
+                pass
+
+        return manifest_path, manifest
+
+    except Exception as exc:
+
+        # ------------------------------------------------
+        # attach成功以后已经提交。
+        #
+        # 理论上目前 committed=True 后只有
+        # best-effort backup cleanup 和 return，
+        # 但这里仍保留防线，禁止误回滚已提交发行。
+        # ------------------------------------------------
+
+        if committed:
+            raise
+
+        rollback_diagnostics = []
 
         try:
-
-            carrier = issue_watermarked_pages(
-                source_path=input_pdf,
-                registry_path=registry_path,
-                page_records=page_records,
-                dpi=dpi,
-                media_box_points=media_box,
-                document_assets=document_assets,
-                key=key,
-                key_id=_key_id(key),
-                alpha=alpha,
-                repeat=repeat,
-                pilot_bits=pilot_bits,
-                pilot_repeat=pilot_repeat,
-                pilot_alpha=pilot_alpha,
-                recipient=recipient,
-                session=session,
-                notes=notes,
-                trace_token=trace_token,
-                watermark_number=watermark_number,
-                source_name=source_name,
-                source_type="pdf",
-                render_unit_type="page",
-                issue_context=issue_context,
-            )
-
-            document_id = carrier[
-                "document_id"
-            ]
-
-            document = carrier[
-                "document"
-            ]
-
-            issue = carrier[
-                "issue"
-            ]
-
-            token = carrier[
-                "trace_token"
-            ]
-
-            payload = carrier[
-                "encoded_bits"
-            ]
-
-            embedded_pages = carrier[
-                "embedded_pages"
-            ]
-
-            manifest_pages = carrier[
-                "manifest_pages"
-            ]
-
-
-
-            # ------------------------------------------------
-            # 准备最终PDF输出路径
-            # ------------------------------------------------
-
-            output_tmp = (
-                output_pdf.with_suffix(
-                    ".tmp.pdf"
+            rollback_diagnostics = (
+                _rollback_pdf_issue_failure(
+                    registry_path=registry_path,
+                    issue_context=issue_context,
+                    output_pdf=output_pdf,
+                    output_pdf_owned=
+                        output_pdf_owned,
+                    output_tmp_owned=
+                        output_tmp_owned,
+                    output_backup=
+                        output_backup,
+                    manifest_path=
+                        manifest_path,
+                    manifest_owned=
+                        manifest_owned,
                 )
             )
 
-            # _save_raster_pdf() 会使用固定的 .tmp.pdf。
-            #
-            # 如果调用开始前这个路径已经存在，
-            # 我们没有所有权，不能覆盖，也不能删除。
-            if output_tmp.exists():
-                raise FileExistsError(
-                    "PDF临时输出文件已存在，"
-                    "拒绝覆盖未知历史文件: "
-                    f"{output_tmp}"
+        except Exception as rollback_exc:
+            # 回滚自身即使出现意外异常，
+            # 也不能覆盖真正导致发行失败的原始异常。
+            rollback_diagnostics = [
+                (
+                    "PDF回滚执行器异常: "
+                    f"{type(rollback_exc).__name__}: "
+                    f"{rollback_exc}"
                 )
+            ]
 
-            # 从这一刻开始，如果 .tmp.pdf 出现，
-            # 就可以确认它属于本次发行。
-            output_tmp_owned = True
-
-            # ------------------------------------------------
-            # 如果最终输出PDF已经存在，先保存旧版本。
-            # ------------------------------------------------
-
-            if output_pdf.exists():
-
-                if not output_pdf.is_file():
-                    raise FileExistsError(
-                        "PDF输出路径已存在且不是文件: "
-                        f"{output_pdf}"
-                    )
-
-                output_backup = (
-                    output_pdf.with_name(
-                        output_pdf.name
-                        + "."
-                        + token
-                        + ".rollback.bak"
-                    )
-                )
-
-                if output_backup.exists():
-                    raise FileExistsError(
-                        "PDF回滚备份文件已存在，"
-                        "拒绝覆盖未知历史文件: "
-                        f"{output_backup}"
-                    )
-
-                output_pdf.replace(
-                    output_backup
-                )
-
-            # 如果后面的PDF生成产生最终 output_pdf，
-            # 那么它一定属于本次发行。
-            output_pdf_owned = True
-
-
-
-            _save_raster_pdf(embedded_pages, output_pdf, dpi=dpi)
-
-            # ------------------------------------------------
-            # 本次TraceToken独占自己的Manifest路径。
-            # ------------------------------------------------
-
-            manifest_path = (
-                document_assets
-                / f"manifest_{token}.json"
-            ).resolve()
-
-            manifest_tmp = (
-                manifest_path.with_suffix(
-                    manifest_path.suffix
-                    + ".tmp"
-                )
-            )
-
-            # final 和 tmp 只要任意一个在本次发行前存在，
-            # 就不能声称拥有它。
-            if manifest_path.exists():
-                raise FileExistsError(
-                    "Manifest文件已存在，"
-                    "拒绝覆盖未知历史文件: "
-                    f"{manifest_path}"
-                )
-
-            if manifest_tmp.exists():
-                raise FileExistsError(
-                    "Manifest临时文件已存在，"
-                    "拒绝覆盖未知历史文件: "
-                    f"{manifest_tmp}"
-                )
-
-            # 从这里开始，如果 final/tmp 出现，
-            # 都必定是本次 _write_json() 创建的。
-            manifest_owned = True
-
-            manifest = {
-                "schema_version": MANIFEST_SCHEMA_VERSION,
-                "created_at": _now_iso(),
-                "watermark_version": DOCUMENT_WATERMARK_VERSION,
-                "source_pdf": str(input_pdf),
-                "source_sha256": source_sha256,
-                "output_pdf": str(output_pdf),
-                "output_sha256": sha256_file(output_pdf),
-                "document_id": document_id,
-                "page_count": len(page_records),
-                "dpi": int(dpi),
-                "media_box_points": media_box,
-                "trace_id": issue["trace_id"],
-                "trace_token": token,
-                "watermark_number": issue.get("watermark_number"),
-                "encoded_bits": [int(bit) for bit in payload],
-                "key_id": _key_id(key),
-                "watermark": {
-                    "block_size": 8,
-                    "bit_count": DOCUMENT_CODEWORD_BITS,
-                    "alpha": float(alpha),
-                    "repeat": int(repeat),
-                    "adaptive_alpha": True,
-                    "sync_pilot": {
-                        "enabled": True,
-                        "version": "pn64-v1",
-                        "bit_count": int(pilot_bits),
-                        "repeat": int(pilot_repeat),
-                        "alpha": float(pilot_alpha),
-                        "position_offset": DOCUMENT_CODEWORD_BITS * int(repeat),
-                    },
-                },
-                "pages": manifest_pages,
-                "render_warnings": (
-                    render_warnings.splitlines()
-                    if render_warnings
-                    else []
-                ),
-                "elapsed_ms": (
-                    time.perf_counter()
-                    - started
-                ) * 1000.0,
-            }
-
-            # 每一次水印发行都有独立 TraceToken，因此 Manifest
-            # 也必须使用独立文件名，避免同一源文档多次发行时互相覆盖。
-
-            _write_json(
-                manifest_path,
-                manifest,
-            )
-
-            attach_issue_artifact(
-                registry_path,
-                token,
-                output_pdf,
-                manifest_path,
-            )
-
-            # ------------------------------------------------
-            # 逻辑提交点：
-            #
-            # Registry 已经正式关联 output + manifest。
-            # 从这一行以后不得执行发行回滚。
-            # ------------------------------------------------
-
-            committed = True
-            # ------------------------------------------------
-            # 提交成功后，旧PDF回滚备份已经不再需要。
-            #
-            # 删除失败不能把一次已经成功提交的发行
-            # 重新变成失败。
-            # ------------------------------------------------
-
-            if (
-                output_backup is not None
-                and output_backup.is_file()
-            ):
-                try:
-                    output_backup.unlink()
-
-                except OSError:
-                    pass
-
-            return manifest_path, manifest
-
-        except Exception as exc:
-
-            # ------------------------------------------------
-            # attach成功以后已经提交。
-            #
-            # 理论上目前 committed=True 后只有
-            # best-effort backup cleanup 和 return，
-            # 但这里仍保留防线，禁止误回滚已提交发行。
-            # ------------------------------------------------
-
-            if committed:
-                raise
-
-            rollback_diagnostics = []
-
+        # 将诊断附着到原异常对象上。
+        #
+        # 不修改原始异常类型和原始错误消息。
+        if rollback_diagnostics:
             try:
-                rollback_diagnostics = (
-                    _rollback_pdf_issue_failure(
-                        registry_path=registry_path,
-                        issue_context=issue_context,
-                        output_pdf=output_pdf,
-                        output_pdf_owned=
-                            output_pdf_owned,
-                        output_tmp_owned=
-                            output_tmp_owned,
-                        output_backup=
-                            output_backup,
-                        manifest_path=
-                            manifest_path,
-                        manifest_owned=
-                            manifest_owned,
-                    )
+                setattr(
+                    exc,
+                    "rollback_diagnostics",
+                    rollback_diagnostics,
                 )
 
-            except Exception as rollback_exc:
-                # 回滚自身即使出现意外异常，
-                # 也不能覆盖真正导致发行失败的原始异常。
-                rollback_diagnostics = [
-                    (
-                        "PDF回滚执行器异常: "
-                        f"{type(rollback_exc).__name__}: "
-                        f"{rollback_exc}"
-                    )
-                ]
+            except Exception:
+                pass
 
-            # 将诊断附着到原异常对象上。
-            #
-            # 不修改原始异常类型和原始错误消息。
-            if rollback_diagnostics:
-                try:
-                    setattr(
-                        exc,
-                        "rollback_diagnostics",
-                        rollback_diagnostics,
-                    )
-
-                except Exception:
-                    pass
-
-            # 这里必须使用裸 raise，
-            # 才会重新抛出原始异常及其原 traceback。
-            raise
+        # 这里必须使用裸 raise，
+        # 才会重新抛出原始异常及其原 traceback。
+        raise
 
 
 def aggregate_trimmed_repeat_scores(details, trim_ratio=0.20):
