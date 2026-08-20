@@ -311,11 +311,36 @@ def embed_document_pdf(
                 },
             },
             "pages": manifest_pages,
-            "render_warnings": render_warnings.splitlines() if render_warnings else [],
-            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            "render_warnings": (
+                render_warnings.splitlines()
+                if render_warnings
+                else []
+            ),
+            "elapsed_ms": (
+                time.perf_counter()
+                - started
+            ) * 1000.0,
         }
-        _write_json(manifest_path, manifest)
-        attach_issue_artifact(registry_path, token, output_pdf, manifest_path)
+
+        # 每一次水印发行都有独立 TraceToken，因此 Manifest
+        # 也必须使用独立文件名，避免同一源文档多次发行时互相覆盖。
+        manifest_path = (
+            document_assets
+            / f"manifest_{token}.json"
+        ).resolve()
+
+        _write_json(
+            manifest_path,
+            manifest,
+        )
+
+        attach_issue_artifact(
+            registry_path,
+            token,
+            output_pdf,
+            manifest_path,
+        )
+
         return manifest_path, manifest
 
 
