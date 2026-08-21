@@ -56,6 +56,7 @@ ALLOWED_CONTENT_TYPES = {
 DOCUMENT_TYPES_BY_SUFFIX = {
     ".pdf": "pdf",
     ".pptx": "pptx",
+    ".docx": "docx",
 }
 
 DOCUMENT_EMBED_PROFILES = {
@@ -76,6 +77,14 @@ DOCUMENT_EMBED_PROFILES = {
         "pilot_repeat": 8,
         "pilot_alpha": 90.0,
     },
+    "docx": {
+        "dpi": 150,
+        "alpha": 42.0,
+        "repeat": 16,
+        "pilot_bits": 64,
+        "pilot_repeat": 6,
+        "pilot_alpha": 78.0,
+    },
 }
 
 
@@ -88,12 +97,19 @@ DOCUMENT_CONTENT_TYPES = {
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "application/octet-stream",
     },
+    ".docx": {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/octet-stream",
+    },
 }
 
 ARTIFACT_CONTENT_TYPES = {
     ".pdf": "application/pdf",
     ".pptx": (
         "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ),
 }
 STATIC_ROUTES = {
@@ -126,6 +142,135 @@ class UploadError(Exception):
     def __init__(self, message, status=HTTPStatus.BAD_REQUEST):
         super().__init__(message)
         self.status = status
+
+def convert_office_to_pdf(input_path, output_dir):
+    """
+    DOCX/PPTX 转 PDF
+
+    DOCX:
+        Microsoft Word COM
+
+    PPTX:
+        Microsoft PowerPoint COM
+    """
+
+    import pythoncom
+    import win32com.client
+
+
+    input_path = Path(input_path).resolve()
+    output_dir = Path(output_dir).resolve()
+
+
+    suffix = input_path.suffix.lower()
+
+
+    if suffix not in [".docx", ".pptx"]:
+        raise RuntimeError(
+            "当前仅支持DOCX/PPTX转换PDF"
+        )
+
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    pdf_path = (
+        output_dir /
+        (input_path.stem + ".pdf")
+    )
+
+
+    pythoncom.CoInitialize()
+
+
+    app = None
+    document = None
+
+
+    try:
+
+        # =========================
+        # DOCX
+        # =========================
+        if suffix == ".docx":
+
+            app = win32com.client.Dispatch(
+                "Word.Application"
+            )
+
+            app.Visible = False
+            app.DisplayAlerts = False
+
+
+            document = app.Documents.Open(
+                str(input_path)
+            )
+
+
+            document.SaveAs(
+                str(pdf_path),
+                FileFormat=17
+            )
+
+
+        # =========================
+        # PPTX
+        # =========================
+        elif suffix == ".pptx":
+
+            app = win32com.client.Dispatch(
+                "PowerPoint.Application"
+            )
+
+
+
+
+            presentation = app.Presentations.Open(
+                str(input_path),
+                WithWindow=False
+            )
+
+
+            presentation.SaveAs(
+                str(pdf_path),
+                32
+            )
+
+
+            presentation.Close()
+
+
+
+    finally:
+
+        try:
+            if document is not None:
+                document.Close(False)
+        except Exception:
+            pass
+
+
+        try:
+            if app is not None:
+                app.Quit()
+        except Exception:
+            pass
+
+
+        pythoncom.CoUninitialize()
+
+
+
+    if not pdf_path.exists():
+        raise RuntimeError(
+            "Office转换PDF失败"
+        )
+
+
+    return pdf_path
 
 
 def _finite_round(value, digits=3):
@@ -597,6 +742,7 @@ def make_request_handler(config):
             Currently supported:
                 PDF
                 PPTX
+                DOCX
             """
 
             import io
@@ -619,7 +765,7 @@ def make_request_handler(config):
                     "没有收到文档文件"
                 )
 
-# 文档上传大小限制，当前适用于 PDF 和 PPTX。
+# 文档上传大小限制，当前适用于 PDF、PPTX 和 DOCX。
             if length > int(
                 config.max_document_upload_bytes
             ):
@@ -687,6 +833,11 @@ def make_request_handler(config):
                         "PPTX文件类型无效"
                     )
 
+                if suffix == ".docx":
+                    raise UploadError(
+                        "DOCX文件类型无效"
+                    )
+
                 raise UploadError(
                     "不支持的文档文件类型"
                 )
@@ -744,6 +895,34 @@ def make_request_handler(config):
                     raise UploadError(
                         "文件不是有效的PPTX"
                     )
+                    
+            elif suffix == ".docx":
+                try:
+                    with zipfile.ZipFile(
+                        io.BytesIO(body),
+                        "r",
+                    ) as archive:
+                        names = set(
+                            archive.namelist()
+                        )
+
+                except (
+                    zipfile.BadZipFile,
+                    OSError,
+                ) as error:
+                    raise UploadError(
+                        "文件不是有效的DOCX"
+                    ) from error
+
+                required_entries = {
+                    "[Content_Types].xml",
+                    "word/document.xml",
+                }
+
+                if not required_entries.issubset(names):
+                    raise UploadError(
+                        "文件不是有效的DOCX"
+                    )                    
 
             # -------------------------------------------------
             # 5. 生成安全的临时文件名
@@ -872,6 +1051,9 @@ def make_request_handler(config):
                     input_path.suffix.lower()
                 )
 
+                # 最终水印输出统一为PDF
+                output_suffix = ".pdf"
+
                 if source_suffix not in DOCUMENT_TYPES_BY_SUFFIX:
                     raise UploadError(
                         "暂不支持该文档类型"
@@ -880,7 +1062,25 @@ def make_request_handler(config):
                 source_type = DOCUMENT_TYPES_BY_SUFFIX[
                     source_suffix
                 ]
+                # DOCX/PPTX统一转换为PDF进入水印流程
 
+                original_input_path = input_path
+
+
+                if source_type in {"docx", "pptx"}:
+
+                    converted_dir = (
+                        config.document_input_dir
+                        /
+                        "converted_pdf"
+                    )
+
+                    input_path = convert_office_to_pdf(
+                        input_path,
+                        converted_dir
+                    )
+
+                    source_type = "pdf"
                 # -------------------------------------------------
                 # 选择本次发行Profile。
                 #
@@ -974,7 +1174,7 @@ def make_request_handler(config):
                         f"{safe_stem}"
                         f"_wm_"
                         f"{watermark_number}"
-                        f"{source_suffix}"
+                        f"{output_suffix}"
                     )
                 )
 
@@ -1091,6 +1291,16 @@ def make_request_handler(config):
                     )
 
                     document_label = "PPTX"
+                elif source_type == "docx":
+
+                    preview_url = None
+
+                    description = (
+                        "水印Word文档已生成并登记，"
+                        "请下载后使用Microsoft Word打开。"
+                    )
+
+                    document_label = "DOCX"
 
                 else:
                     preview_url = None
@@ -1320,6 +1530,7 @@ def make_request_handler(config):
                 #
                 #   PDF
                 #   PPTX
+                #   DOCX
                 #
                 # 使用 ARTIFACT_CONTENT_TYPES 作为允许类型白名单，
                 # 避免把注册记录中任意未知文件一起移动。
