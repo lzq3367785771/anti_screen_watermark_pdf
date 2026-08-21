@@ -6,7 +6,7 @@
 
   <meta
     name="description"
-    content="本地完成PDF和PowerPoint文档水印嵌入，并对偷拍文档照片进行水印溯源。"
+    content="本地完成PDF、PowerPoint和Word文档水印嵌入，并对偷拍文档照片进行水印溯源。"
   >
 
   <title>文档水印工作台</title>
@@ -83,7 +83,7 @@
       </h1>
 
       <p>
-        上传 PDF 或 PowerPoint 即可生成带水印文档；
+        上传 PDF、PowerPoint 或 Word 即可生成带水印文档；
         上传拍摄照片即可查找水印号码。
         处理和注册信息全部保留在本机。
       </p>
@@ -105,7 +105,7 @@
         <span>01</span>
         <strong>嵌入水印</strong>
         <small>
-          PDF / PPTX → 带水印文档
+          PDF / PPTX / DOCX → 带水印文档
         </small>
       </button>
 
@@ -162,7 +162,7 @@
             </div>
 
             <span class="format-note">
-              PDF · PPTX · 最大100 MB
+              PDF · PPTX · DOCX · 最大100 MB
             </span>
           </div>
 
@@ -189,15 +189,17 @@
             </small>
           </label>
 
-<!-- PDF / PPTX source document input -->
+<!-- PDF / PPTX / DOCX source document input -->
           <input
             id="pdfInput"
             type="file"
             accept="
               application/pdf,
               application/vnd.openxmlformats-officedocument.presentationml.presentation,
+              application/vnd.openxmlformats-officedocument.wordprocessingml.document,
               .pdf,
-              .pptx
+              .pptx,
+              .docx
             "
             hidden
           >
@@ -218,7 +220,7 @@
             </span>
 
             <strong>
-              拖拽 PDF 或 PPTX 到这里
+              拖拽 PDF、PPTX 或 DOCX 到这里
             </strong>
 
             <span>
@@ -226,7 +228,7 @@
             </span>
 
             <em>
-              PDF 将逐页处理，PPTX 将逐张幻灯片处理，
+              PDF 将逐页处理，PPTX 将逐张幻灯片处理，DOCX 将逐页处理，
               并生成新的同格式水印文件
             </em>
           </button>
@@ -807,7 +809,7 @@
     </span>
 
     <span>
-      PDF / PPTX 发行 + V2.0A.2 局部分区溯源
+      PDF / PPTX / DOCX 发行 + V2.0A.2 局部分区溯源
     </span>
   </footer>
 
