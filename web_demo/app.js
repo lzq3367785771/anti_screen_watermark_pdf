@@ -118,6 +118,14 @@ const DOCUMENT_TYPES = {
     label: "PPTX",
     unit: "张幻灯片",
   },
+
+  docx: {
+    suffix: ".docx",
+    mime:
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    label: "DOCX",
+    unit: "页",
+  },
 };
 
 
@@ -311,6 +319,10 @@ function getDocumentType(file) {
 
   if (name.endsWith(".pptx")) {
     return "pptx";
+  }
+
+  if (name.endsWith(".docx")) {
+    return "docx";
   }
 
   return null;
@@ -531,7 +543,7 @@ function selectDocument(file) {
   if (!type) {
     setError(
       elements.embedError,
-      "仅支持PDF和PPTX文件"
+      "仅支持PDF、PPTX和DOCX文件"
     );
 
     return;
@@ -1352,7 +1364,7 @@ async function embedDocument() {
   ) {
     setError(
       elements.embedError,
-      "请填写有效水印号码并选择PDF或PPTX文档"
+      "请填写有效水印号码并选择PDF、PPTX或DOCX文档"
     );
 
     return;
