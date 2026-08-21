@@ -323,8 +323,33 @@ class DocumentCarrierTests(unittest.TestCase):
             root = Path(temporary)
             old_path = root / "old.manifest.json"
             new_path = root / "new.manifest.json"
-            old_path.write_text('{"trace_token":"old"}', encoding="utf-8")
-            new_path.write_text('{"trace_token":"new"}', encoding="utf-8")
+            base_manifest = {
+                "schema_version": 2,
+                "key_id": "0123456789abcdef",
+                "page_count": 1,
+                "watermark": {
+                    "block_size": 8,
+                    "bit_count": DOCUMENT_CODEWORD_BITS,
+                    "alpha": 42.0,
+                    "repeat": 16,
+                    "sync_pilot": {
+                        "enabled": True,
+                        "bit_count": 64,
+                        "repeat": 6,
+                        "alpha": 78.0,
+                        "position_offset": 2240,
+                    },
+                },
+                "pages": [{"page_index": 1}],
+            }
+            old_path.write_text(
+                json.dumps({**base_manifest, "trace_token": "old"}),
+                encoding="utf-8",
+            )
+            new_path.write_text(
+                json.dumps({**base_manifest, "trace_token": "new"}),
+                encoding="utf-8",
+            )
             registry = {
                 "issues": {
                     "old": {

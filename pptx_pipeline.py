@@ -14,10 +14,11 @@ from document_carrier import (
 )
 
 from document_registry import (
-    DOCUMENT_CODEWORD_BITS,
+    DOCUMENT_MANIFEST_SCHEMA_VERSION,
     DOCUMENT_WATERMARK_VERSION,
     attach_issue_artifact,
     load_registered_reference_set,
+    key_id_for_key,
     rollback_unattached_issue,
     sha256_file,
 )
@@ -74,12 +75,7 @@ def _write_json(path, data):
 
 
 def _key_id(key):
-
-    import hashlib
-
-    return hashlib.sha256(
-        str(key).encode("utf-8")
-    ).hexdigest()[:16]
+    return key_id_for_key(key)
 
 
 def _rollback_pptx_issue_failure(
@@ -1183,7 +1179,7 @@ def embed_document_pptx(
 
         manifest = {
             "schema_version":
-                1,
+                DOCUMENT_MANIFEST_SCHEMA_VERSION,
 
             "pipeline_version":
                 PPTX_PIPELINE_VERSION,
@@ -1306,51 +1302,8 @@ def embed_document_pptx(
             # trace_document_photo()、PN同步、DCT提取都会读取它。
             # --------------------------------------------------------
 
-            "watermark": {
-                "block_size":
-                    8,
-
-                "bit_count":
-                    DOCUMENT_CODEWORD_BITS,
-
-                "alpha":
-                    float(alpha),
-
-                "repeat":
-                    int(repeat),
-
-                "adaptive_alpha":
-                    True,
-
-                "sync_pilot": {
-                    "enabled":
-                        True,
-
-                    "version":
-                        "pn64-v1",
-
-                    "bit_count":
-                        int(
-                            pilot_bits
-                        ),
-
-                    "repeat":
-                        int(
-                            pilot_repeat
-                        ),
-
-                    "alpha":
-                        float(
-                            pilot_alpha
-                        ),
-
-                    "position_offset":
-                        (
-                            DOCUMENT_CODEWORD_BITS
-                            * int(repeat)
-                        ),
-                },
-            },
+            "watermark":
+                carrier["watermark_config"],
 
         # --------------------------------------------------------
         # PPTX特有信息

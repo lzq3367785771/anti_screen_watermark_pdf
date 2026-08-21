@@ -4,8 +4,8 @@ This module is the format-dispatch layer above the existing PDF pipeline.
 
 Current status:
     PDF   -> implemented
-    DOCX  -> recognized, renderer not implemented yet
-    PPTX  -> recognized, renderer not implemented yet
+    DOCX  -> implemented as flattened raster PDF
+    PPTX  -> implemented
     XLSX  -> recognized, renderer not implemented yet
 
 The watermark carrier itself remains in the existing PDF/image pipeline.
@@ -17,9 +17,10 @@ from pathlib import Path
 
 from document_registry import infer_source_type
 from pdf_pipeline import DEFAULT_KEY, embed_document_pdf
+from docx_pipeline import embed_document_docx
 from pptx_pipeline import embed_document_pptx
 
-DOCUMENT_PIPELINE_VERSION = "v2.1.1"
+DOCUMENT_PIPELINE_VERSION = "v2.1.2"
 
 SUPPORTED_SOURCE_TYPES = {
     "pdf",
@@ -30,6 +31,7 @@ SUPPORTED_SOURCE_TYPES = {
 
 IMPLEMENTED_EMBED_TYPES = {
     "pdf",
+    "docx",
     "pptx",
 }
 
@@ -82,9 +84,10 @@ def embed_document(
     V2.1.1 当前已经实现：
 
         PDF
+        DOCX（输出为扁平化PDF）
         PPTX
 
-    DOCX / XLSX 已能够被识别，但对应的文档渲染/重建 Adapter
+    XLSX 已能够被识别，但对应的文档渲染/重建 Adapter
     尚未实现，因此会明确返回 NotImplementedError，而不会错误地
     进入 PDF 或 PPTX 处理路径。
     """
@@ -120,6 +123,32 @@ def embed_document(
             pilot_repeat=pilot_repeat,
             pilot_alpha=pilot_alpha,
             poppler_bin=poppler_bin,
+            recipient=recipient,
+            session=session,
+            notes=notes,
+            trace_token=trace_token,
+            watermark_number=watermark_number,
+            source_name=source_name,
+        )
+
+    # --------------------------------------------------------
+    # DOCX Adapter (flattened raster PDF output)
+    # --------------------------------------------------------
+
+    if resolved_type == "docx":
+
+        return embed_document_docx(
+            input_docx=input_path,
+            registry_path=registry_path,
+            output_pdf=output_path,
+            key=key,
+            dpi=dpi,
+            assets_root=assets_root,
+            alpha=alpha,
+            repeat=repeat,
+            pilot_bits=pilot_bits,
+            pilot_repeat=pilot_repeat,
+            pilot_alpha=pilot_alpha,
             recipient=recipient,
             session=session,
             notes=notes,
@@ -172,7 +201,7 @@ def embed_document(
             source_name=source_name,
         )
     # --------------------------------------------------------
-    # Office Adapter
+    # Remaining Office Adapter
     #
     # 先识别但不假装已经支持。
     # 后续 V2.1.1 / V2.1.2 会逐个接入。

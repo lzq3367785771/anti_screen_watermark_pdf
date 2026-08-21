@@ -8,7 +8,6 @@ boundary detector is used as a fallback for low-feature full-page captures.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -24,12 +23,14 @@ from PIL import Image
 
 from document_registry import (
     DOCUMENT_CODEWORD_BITS,
+    DOCUMENT_MANIFEST_SCHEMA_VERSION,
     DOCUMENT_WATERMARK_VERSION,
     attach_issue_artifact,
     decode_document_soft_scores,
     derive_page_key,
     load_document_registry,
     load_registered_reference_set,
+    key_id_for_key,
     rollback_unattached_issue,
     score_registered_tokens,
     sha256_file,
@@ -38,6 +39,7 @@ from document_registry import (
 from document_carrier import (
     embed_bits_adaptive,
     issue_watermarked_pages,
+    normalize_watermark_config,
 )
 
 
@@ -55,7 +57,7 @@ from watermark import (
 
 
 DEFAULT_KEY = "ANTI_SCREEN_DOCUMENT_SECRET_KEY_2026"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = DOCUMENT_MANIFEST_SCHEMA_VERSION
 TRACE_REPORT_SCHEMA_VERSION = 2
 
 
@@ -77,8 +79,44 @@ def _read_json(path):
         return json.load(file_obj)
 
 
+def normalize_document_manifest(manifest):
+    """Return one validated canonical manifest, including schema-v1 recovery."""
+
+    if not isinstance(manifest, dict):
+        raise ValueError("Manifest根节点必须为对象")
+    schema_version = int(manifest.get("schema_version", -1))
+    if schema_version not in (1, MANIFEST_SCHEMA_VERSION):
+        raise ValueError(f"不支持的Manifest schema_version: {schema_version}")
+
+    normalized = dict(manifest)
+    pages = normalized.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("Manifest缺少有效pages")
+    page_count = int(normalized.get("page_count", len(pages)))
+    if page_count != len(pages):
+        raise ValueError("Manifest page_count与pages数量不一致")
+    normalized["page_count"] = page_count
+
+    watermark = dict(normalized.get("watermark") or {})
+    top_key_id = normalized.get("key_id")
+    legacy_key_id = watermark.pop("key_id", None)
+    if top_key_id and legacy_key_id and str(top_key_id) != str(legacy_key_id):
+        raise ValueError("Manifest顶层key_id与watermark.key_id不一致")
+    resolved_key_id = str(top_key_id or legacy_key_id or "").strip().lower()
+    if not resolved_key_id:
+        raise ValueError("Manifest缺少key_id")
+    normalized["key_id"] = resolved_key_id
+    normalized["watermark"] = normalize_watermark_config(
+        watermark,
+        pages=pages,
+        strict=(schema_version == MANIFEST_SCHEMA_VERSION),
+    )
+    normalized["schema_version"] = schema_version
+    return normalized
+
+
 def _key_id(key):
-    return hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:16]
+    return key_id_for_key(key)
 
 
 def resolve_pdftoppm(poppler_bin=None):
@@ -1029,21 +1067,7 @@ def embed_document_pdf(
             "watermark_number": issue.get("watermark_number"),
             "encoded_bits": [int(bit) for bit in payload],
             "key_id": _key_id(key),
-            "watermark": {
-                "block_size": 8,
-                "bit_count": DOCUMENT_CODEWORD_BITS,
-                "alpha": float(alpha),
-                "repeat": int(repeat),
-                "adaptive_alpha": True,
-                "sync_pilot": {
-                    "enabled": True,
-                    "version": "pn64-v1",
-                    "bit_count": int(pilot_bits),
-                    "repeat": int(pilot_repeat),
-                    "alpha": float(pilot_alpha),
-                    "position_offset": DOCUMENT_CODEWORD_BITS * int(repeat),
-                },
-            },
+            "watermark": carrier["watermark_config"],
             "pages": manifest_pages,
             "render_warnings": (
                 render_warnings.splitlines()
@@ -1928,7 +1952,7 @@ def extract_digital_pdf(
     report_path=None,
 ):
     started = time.perf_counter()
-    manifest = _read_json(manifest_path)
+    manifest = normalize_document_manifest(_read_json(manifest_path))
     if manifest.get("key_id") != _key_id(key):
         raise ValueError("密钥与Manifest的key_id不一致")
     registry = load_document_registry(registry_path)
@@ -2170,10 +2194,16 @@ def match_photo_to_registered_page(photo, registry):
     return None, []
 
 
-def _manifest_for_document(registry, document_id):
+def _manifest_for_document(registry, document_id, key_id=None):
     candidates = []
+    document_issues = []
     for issue in registry.get("issues", {}).values():
         if issue.get("document_id") != document_id:
+            continue
+        if issue.get("status", "issued") != "issued":
+            continue
+        document_issues.append(issue)
+        if key_id is not None and issue.get("key_id") != key_id:
             continue
         manifest_path = issue.get("manifest_path")
         if manifest_path and Path(manifest_path).is_file():
@@ -2184,8 +2214,26 @@ def _manifest_for_document(registry, document_id):
             ))
     if candidates:
         _, _, selected_path = max(candidates, key=lambda item: (item[0], item[1]))
-        return selected_path, _read_json(selected_path)
+        return selected_path, normalize_document_manifest(_read_json(selected_path))
+    if key_id is not None and document_issues:
+        raise ValueError("密钥与登记文档的key_id不一致")
     raise FileNotFoundError(f"文档{document_id}没有可用发行Manifest")
+
+
+def _traceable_registry_for_key(registry, document_id, key_id):
+    """Exclude unfinished or differently keyed issues from trace candidates."""
+
+    filtered = dict(registry)
+    filtered["issues"] = {
+        token: issue
+        for token, issue in registry.get("issues", {}).items()
+        if issue.get("status", "issued") == "issued"
+        and issue.get("document_id") == document_id
+        and issue.get("key_id") == key_id
+        and issue.get("manifest_path")
+        and (issue.get("output_path") or issue.get("output_pdf"))
+    }
+    return filtered
 
 
 def trace_document_photo(
@@ -2198,6 +2246,7 @@ def trace_document_photo(
     rerank_seed_count=2,
     local_payload_top_k=27,
     trim_ratio=0.20,
+    synchronized_min_z_score=3.0,
 ):
     started = time.perf_counter()
     photo_path = Path(photo_path).resolve()
@@ -2241,9 +2290,19 @@ def trace_document_photo(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    manifest_path, manifest = _manifest_for_document(registry, best["document_id"])
-    if manifest.get("key_id") != _key_id(key):
+    active_key_id = _key_id(key)
+    manifest_path, manifest = _manifest_for_document(
+        registry,
+        best["document_id"],
+        key_id=active_key_id,
+    )
+    if manifest.get("key_id") != active_key_id:
         raise ValueError("密钥与登记文档的key_id不一致")
+    registry = _traceable_registry_for_key(
+        registry,
+        best["document_id"],
+        active_key_id,
+    )
     page_key = derive_page_key(
         key, best["document_id"], int(best["page_index"])
     )
@@ -2349,6 +2408,13 @@ def trace_document_photo(
             registry_decision,
             trim_ratio=trim_ratio,
             payload_top_k=local_payload_top_k,
+        )
+    if sync_accepted:
+        registry_decision = score_registered_tokens(
+            scores,
+            registry,
+            document_id=best["document_id"],
+            min_z_score=float(synchronized_min_z_score),
         )
     synchronization["local_partition_sync"] = local_partition_report
     token = decoded.get("trace_token")

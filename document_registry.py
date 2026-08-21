@@ -29,6 +29,7 @@ from codec import (
 
 
 REGISTRY_SCHEMA_VERSION = 1
+DOCUMENT_MANIFEST_SCHEMA_VERSION = 2
 DOCUMENT_WATERMARK_VERSION = "pdf-v2.0a"
 TRACE_TOKEN_BYTES = 8
 PAYLOAD_BYTES = TRACE_TOKEN_BYTES + 2
@@ -45,6 +46,32 @@ def sha256_file(path):
         for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def key_id_for_key(key):
+    """Return the stable, non-secret identifier stored beside one key."""
+
+    if key is None or not str(key):
+        raise ValueError("水印密钥不能为空")
+    return hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:16]
+
+
+def validate_key_id(key, key_id=None):
+    """Derive ``key_id`` or reject a caller-supplied mismatching value."""
+
+    expected = key_id_for_key(key)
+    if key_id is None or not str(key_id).strip():
+        return expected
+
+    supplied = str(key_id).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", supplied):
+        raise ValueError("key_id必须为密钥SHA-256的前16个十六进制字符")
+    if supplied != expected:
+        raise ValueError(
+            "key_id与水印密钥不匹配: "
+            f"expected={expected}, supplied={supplied}"
+        )
+    return expected
 
 
 def normalize_trace_token(token):

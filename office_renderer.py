@@ -13,7 +13,7 @@ into raster images that can later be passed to ``document_carrier.py``.
 from __future__ import annotations
 
 from pathlib import Path
-
+from tempfile import TemporaryDirectory
 
 class OfficeRendererUnavailable(RuntimeError):
     """Raised when the required Microsoft Office rendering backend is missing."""
@@ -84,6 +84,22 @@ def _load_powerpoint_backend():
     return pythoncom, win32com.client
 
 
+def _load_word_backend():
+    """Load pywin32 COM support for Microsoft Word lazily."""
+
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as exc:
+        raise OfficeRendererUnavailable(
+            "未安装Word渲染依赖pywin32。"
+            "请执行: python -m pip install pywin32"
+        ) from exc
+
+    return pythoncom, win32com.client
+
+
+
 def check_powerpoint_backend():
     """Check whether Microsoft PowerPoint COM automation is available."""
 
@@ -125,6 +141,51 @@ def check_powerpoint_backend():
                 pass
 
         pythoncom.CoUninitialize()
+
+
+def check_word_backend():
+    """Check whether Microsoft Word COM automation is available."""
+
+    pythoncom, win32_client = (
+        _load_word_backend()
+    )
+
+    pythoncom.CoInitialize()
+
+    application = None
+
+    try:
+        try:
+            application = (
+                win32_client.DispatchEx(
+                    "Word.Application"
+                )
+            )
+        except Exception as exc:
+            raise OfficeRendererUnavailable(
+                "无法启动Microsoft Word。"
+                "请确认Windows中已经安装桌面版Word。"
+            ) from exc
+
+        version = str(
+            application.Version
+        )
+
+        return {
+            "available": True,
+            "version": version,
+        }
+
+    finally:
+        if application is not None:
+            try:
+                application.Quit()
+            except Exception:
+                pass
+
+        pythoncom.CoUninitialize()
+
+
 
 
 def render_pptx_pages(
@@ -366,3 +427,352 @@ def render_pptx_pages(
                 pass
 
         pythoncom.CoUninitialize()
+
+
+def render_docx_pages(
+    docx_path,
+    output_dir,
+    dpi=150,
+    poppler_bin=None,
+):
+    """Render a DOCX document into deterministic PNG page images.
+
+    Rendering pipeline:
+
+        DOCX
+          -> Microsoft Word COM
+          -> temporary PDF
+          -> existing PDF renderer
+          -> page_001.png
+          -> page_002.png
+          -> ...
+
+    Parameters
+    ----------
+    docx_path:
+        Source .docx file.
+
+    output_dir:
+        Directory used to store rendered page PNG images.
+
+    dpi:
+        Target raster resolution.
+
+    poppler_bin:
+        Optional Poppler binary directory passed through to the
+        existing PDF renderer.
+
+    Returns
+    -------
+    tuple[list[Path], dict]
+
+        rendered page paths
+        +
+        rendering metadata
+    """
+
+    docx_path = Path(
+        docx_path
+    ).resolve()
+
+    output_dir = Path(
+        output_dir
+    ).resolve()
+
+    # --------------------------------------------------------
+    # 1. Basic validation
+    # --------------------------------------------------------
+
+    if not docx_path.is_file():
+        raise FileNotFoundError(
+            f"DOCX不存在: {docx_path}"
+        )
+
+    if docx_path.suffix.lower() != ".docx":
+        raise ValueError(
+            "render_docx_pages只接受.docx文件"
+        )
+
+    dpi = int(dpi)
+
+    if dpi <= 0:
+        raise ValueError(
+            "DPI必须大于0"
+        )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # --------------------------------------------------------
+    # Local import is intentional.
+    #
+    # office_renderer is an adapter module. Importing the
+    # existing PDF renderer lazily avoids adding unnecessary
+    # module-level coupling to the PDF pipeline.
+    # --------------------------------------------------------
+
+    from pdf_pipeline import (
+        render_pdf_pages,
+    )
+
+    # --------------------------------------------------------
+    # 2. Temporary PDF belongs only to this renderer call.
+    #
+    # It must never become part of the Canonical Reference
+    # directory.
+    # --------------------------------------------------------
+
+    with TemporaryDirectory(
+        prefix="docx_render_"
+    ) as temporary_dir_value:
+
+        temporary_dir = Path(
+            temporary_dir_value
+        )
+
+        temporary_pdf = (
+            temporary_dir
+            / "word_export.pdf"
+        )
+
+        pythoncom, win32_client = (
+            _load_word_backend()
+        )
+
+        pythoncom.CoInitialize()
+
+        application = None
+        document = None
+
+        try:
+
+            # ------------------------------------------------
+            # 3. Start an isolated Microsoft Word instance.
+            # ------------------------------------------------
+
+            try:
+                application = (
+                    win32_client.DispatchEx(
+                        "Word.Application"
+                    )
+                )
+            except Exception as exc:
+                raise OfficeRendererUnavailable(
+                    "无法启动Microsoft Word。"
+                    "请确认已经安装桌面版Word。"
+                ) from exc
+
+            # Do not show Word UI or modal alert dialogs.
+            try:
+                application.Visible = False
+            except Exception:
+                pass
+
+            try:
+                application.DisplayAlerts = 0
+            except Exception:
+                pass
+
+            # ------------------------------------------------
+            # 4. Open the source DOCX read-only.
+            # ------------------------------------------------
+
+            try:
+                document = (
+                    application.Documents.Open(
+                        str(docx_path),
+                        ConfirmConversions=False,
+                        ReadOnly=True,
+                        AddToRecentFiles=False,
+                        Visible=False,
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Microsoft Word无法打开DOCX: "
+                    f"{docx_path}"
+                ) from exc
+
+            # ------------------------------------------------
+            # 5. Ask Word to calculate the final layout before
+            #    exporting.
+            #
+            # This keeps pagination responsibility inside Word
+            # instead of trying to reproduce it ourselves.
+            # ------------------------------------------------
+
+            try:
+                document.Repaginate()
+            except Exception:
+                pass
+
+            # ------------------------------------------------
+            # 6. Export the whole document as PDF.
+            #
+            # Word constant:
+            #   wdExportFormatPDF = 17
+            # ------------------------------------------------
+
+            try:
+                document.ExportAsFixedFormat(
+                    str(temporary_pdf),
+                    17,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Microsoft Word导出PDF失败: "
+                    f"{docx_path}"
+                ) from exc
+
+        finally:
+
+            # ------------------------------------------------
+            # 7. Release Word BEFORE invoking pdftoppm.
+            #
+            # This avoids keeping the exported PDF locked by
+            # WINWORD.EXE during the next rendering stage.
+            # ------------------------------------------------
+
+            if document is not None:
+                try:
+                    document.Close(
+                        False
+                    )
+                except Exception:
+                    pass
+
+            if application is not None:
+                try:
+                    application.Quit()
+                except Exception:
+                    pass
+
+            pythoncom.CoUninitialize()
+
+        # ----------------------------------------------------
+        # 8. Word claimed to export successfully, but we still
+        #    verify the actual artifact.
+        # ----------------------------------------------------
+
+        if not temporary_pdf.is_file():
+            raise RuntimeError(
+                "Microsoft Word未生成预期PDF: "
+                f"{temporary_pdf}"
+            )
+
+        if temporary_pdf.stat().st_size <= 0:
+            raise RuntimeError(
+                "Microsoft Word生成了空PDF: "
+                f"{temporary_pdf}"
+            )
+
+        # ----------------------------------------------------
+        # 9. Reuse the existing PDF renderer.
+        #
+        # Output names will therefore stay consistent:
+        #
+        #     page_001.png
+        #     page_002.png
+        #     ...
+        # ----------------------------------------------------
+
+        rendered_pages, renderer_stderr = (
+            render_pdf_pages(
+                temporary_pdf,
+                output_dir,
+                dpi=dpi,
+                poppler_bin=poppler_bin,
+            )
+        )
+
+        if not rendered_pages:
+            raise RuntimeError(
+                "DOCX渲染没有产生页面"
+            )
+
+        # ----------------------------------------------------
+        # 10. Record per-page raster geometry.
+        #
+        # Word documents may contain different sections,
+        # orientations or page sizes, so we intentionally do
+        # not assume that every page has one global width and
+        # height.
+        # ----------------------------------------------------
+
+        page_sizes = []
+
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise OfficeRendererUnavailable(
+                "DOCX页面尺寸检查需要Pillow"
+            ) from exc
+
+        for index, page_path in enumerate(
+            rendered_pages,
+            start=1,
+        ):
+            page_path = Path(
+                page_path
+            )
+
+            if not page_path.is_file():
+                raise RuntimeError(
+                    "DOCX渲染页面不存在: "
+                    f"{page_path}"
+                )
+
+            with Image.open(
+                page_path
+            ) as image:
+                width, height = (
+                    image.size
+                )
+
+            if (
+                int(width) <= 0
+                or int(height) <= 0
+            ):
+                raise RuntimeError(
+                    "DOCX渲染页面尺寸非法: "
+                    f"page={index}"
+                )
+
+            page_sizes.append({
+                "page_index":
+                    int(index),
+
+                "width":
+                    int(width),
+
+                "height":
+                    int(height),
+            })
+
+        return rendered_pages, {
+            "source_type":
+                "docx",
+
+            "render_unit_type":
+                "page",
+
+            "renderer":
+                "microsoft_word_com_pdf",
+
+            "dpi":
+                int(dpi),
+
+            "page_count":
+                len(rendered_pages),
+
+            "page_sizes":
+                page_sizes,
+
+            "pdf_renderer_stderr":
+                str(
+                    renderer_stderr
+                    or ""
+                ),
+        }

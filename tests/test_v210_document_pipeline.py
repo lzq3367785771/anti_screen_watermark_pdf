@@ -8,6 +8,7 @@ import numpy as np
 from document_carrier import (
     issue_watermarked_pages,
 )
+from document_registry import key_id_for_key
 
 from pathlib import Path
 from unittest.mock import patch
@@ -25,7 +26,7 @@ class DocumentPipelineTests(unittest.TestCase):
 
         self.assertEqual(
             DOCUMENT_PIPELINE_VERSION,
-            "v2.1.1",
+            "v2.1.2",
         )
 
 
@@ -146,7 +147,9 @@ class DocumentPipelineTests(unittest.TestCase):
                     "carrier-test-key",
 
                 key_id=
-                    "carrier-test-key-id",
+                    key_id_for_key(
+                        "carrier-test-key"
+                    ),
 
                 alpha=55.0,
 
@@ -247,14 +250,12 @@ class DocumentPipelineTests(unittest.TestCase):
             )
 
 
-    def test_docx_is_recognized_but_not_implemented(self):
+    def test_docx_is_dispatched_to_docx_pipeline(self):
 
         with tempfile.TemporaryDirectory() as temporary:
 
             root = Path(temporary)
 
-            # PPTX 从 V2.1.1 开始已经真正实现，
-            # 所以这里改用尚未实现的 DOCX 测试。
             source = root / "document.docx"
 
             source.write_bytes(
@@ -265,15 +266,21 @@ class DocumentPipelineTests(unittest.TestCase):
                 root / "registry.json"
             )
 
-            with self.assertRaisesRegex(
-                NotImplementedError,
-                "DOCX",
-            ):
+            output_path = root / "document-watermarked.pdf"
+            expected = {"trace_token": "0123456789abcdef"}
 
-                embed_document(
+            with patch(
+                "document_pipeline.embed_document_docx",
+                return_value=expected,
+            ) as mocked_embed:
+                actual = embed_document(
                     source,
                     registry_path,
+                    output_path=output_path,
                 )
+
+            self.assertEqual(actual, expected)
+            self.assertEqual(mocked_embed.call_args.kwargs["output_pdf"], output_path)
 
 
     def test_pdf_is_dispatched_to_existing_pdf_pipeline(self):

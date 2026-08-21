@@ -10,6 +10,7 @@ from document_carrier import (
     issue_watermarked_pages,
 )
 from document_registry import (
+    key_id_for_key,
     load_document_registry,
     sha256_file,
 )
@@ -139,7 +140,9 @@ class CarrierIssueContextTests(unittest.TestCase):
             ],
             document_assets=self.document_assets,
             key="TEST_CARRIER_CONTEXT_KEY",
-            key_id="test-key-id",
+            key_id=key_id_for_key(
+                "TEST_CARRIER_CONTEXT_KEY"
+            ),
             alpha=20.0,
             repeat=1,
             pilot_bits=16,

@@ -28,12 +28,148 @@ from document_registry import (
     issue_document_trace,
     register_document,
     sha256_file,
+    validate_key_id,
 )
 from synchronization import generate_sync_pilot
 from watermark import (
     embed_bit,
     generate_positions,
 )
+
+
+def build_watermark_config(
+    alpha=42.0,
+    repeat=16,
+    block_size=8,
+    pilot_bits=64,
+    pilot_repeat=6,
+    pilot_alpha=78.0,
+    payload_flat_bright_scale=0.60,
+    pilot_flat_bright_scale=0.60,
+):
+    """Build the canonical carrier configuration written to every manifest."""
+
+    block_size = int(block_size)
+    repeat = int(repeat)
+    pilot_bits = int(pilot_bits)
+    pilot_repeat = int(pilot_repeat)
+    alpha = float(alpha)
+    pilot_alpha = float(pilot_alpha)
+    payload_flat_bright_scale = float(payload_flat_bright_scale)
+    pilot_flat_bright_scale = float(pilot_flat_bright_scale)
+
+    if block_size < 2:
+        raise ValueError("block_size必须至少为2")
+    if repeat < 1 or pilot_repeat < 1:
+        raise ValueError("payload/pilot重复次数必须为正整数")
+    if pilot_bits < 16:
+        raise ValueError("pilot bit_count必须至少为16")
+    if alpha <= 0.0 or pilot_alpha <= 0.0:
+        raise ValueError("payload/pilot alpha必须为正数")
+    if payload_flat_bright_scale <= 0.0 or pilot_flat_bright_scale <= 0.0:
+        raise ValueError("自适应alpha缩放系数必须为正数")
+
+    return {
+        "block_size": block_size,
+        "bit_count": DOCUMENT_CODEWORD_BITS,
+        "alpha": alpha,
+        "repeat": repeat,
+        "adaptive_alpha": True,
+        "flat_bright_scale": payload_flat_bright_scale,
+        "sync_pilot": {
+            "enabled": True,
+            "version": "pn64-v1",
+            "bit_count": pilot_bits,
+            "repeat": pilot_repeat,
+            "alpha": pilot_alpha,
+            "adaptive_alpha": True,
+            "flat_bright_scale": pilot_flat_bright_scale,
+            "position_offset": DOCUMENT_CODEWORD_BITS * repeat,
+        },
+    }
+
+
+def _consistent_repeat_from_stats(pages, section, bit_count):
+    inferred = set()
+    for page in pages or []:
+        stats = page.get(section) if isinstance(page, dict) else None
+        if not isinstance(stats, dict):
+            continue
+        units = stats.get("dct_units")
+        if units is None:
+            continue
+        units = int(units)
+        if units > 0 and units % int(bit_count) == 0:
+            inferred.add(units // int(bit_count))
+    return inferred.pop() if len(inferred) == 1 else None
+
+
+def normalize_watermark_config(config, pages=None, strict=False):
+    """Normalize schema-v1 manifests and validate schema-v2 carrier fields.
+
+    Early DOCX manifests omitted the pilot enable flag and offset and recorded a
+    payload repeat that disagreed with the actual DCT unit count.  Page embedding
+    statistics are authoritative for those legacy files.
+    """
+
+    if not isinstance(config, dict):
+        raise ValueError("Manifest缺少watermark配置")
+
+    raw = dict(config)
+    sync_raw = dict(raw.get("sync_pilot") or {})
+    bit_count = int(raw.get("bit_count", DOCUMENT_CODEWORD_BITS))
+    if bit_count != DOCUMENT_CODEWORD_BITS:
+        raise ValueError(
+            "Manifest payload bit_count不匹配: "
+            f"{bit_count} != {DOCUMENT_CODEWORD_BITS}"
+        )
+
+    repeat = int(raw.get("repeat", 0) or 0)
+    inferred_repeat = _consistent_repeat_from_stats(
+        pages, "payload_embedding", bit_count
+    )
+    if inferred_repeat is not None and inferred_repeat != repeat:
+        if strict:
+            raise ValueError("Manifest payload repeat与页面DCT统计不一致")
+        repeat = inferred_repeat
+    if repeat < 1:
+        raise ValueError("Manifest缺少有效payload repeat")
+
+    pilot_bits = int(
+        sync_raw.get("bit_count", sync_raw.get("bits", 64))
+    )
+    pilot_repeat = int(sync_raw.get("repeat", 0) or 0)
+    inferred_pilot_repeat = _consistent_repeat_from_stats(
+        pages, "pilot_embedding", pilot_bits
+    )
+    if inferred_pilot_repeat is not None and inferred_pilot_repeat != pilot_repeat:
+        if strict:
+            raise ValueError("Manifest pilot repeat与页面DCT统计不一致")
+        pilot_repeat = inferred_pilot_repeat
+    if pilot_bits < 1 or pilot_repeat < 1:
+        raise ValueError("Manifest缺少有效pilot bit_count/repeat")
+
+    normalized = build_watermark_config(
+        alpha=float(raw.get("alpha", 42.0)),
+        repeat=repeat,
+        block_size=int(raw.get("block_size", 8)),
+        pilot_bits=pilot_bits,
+        pilot_repeat=pilot_repeat,
+        pilot_alpha=float(sync_raw.get("alpha", 78.0)),
+        payload_flat_bright_scale=float(raw.get("flat_bright_scale", 0.60)),
+        pilot_flat_bright_scale=float(
+            sync_raw.get("flat_bright_scale", 0.60)
+        ),
+    )
+
+    explicit_offset = sync_raw.get("position_offset")
+    if explicit_offset is not None:
+        explicit_offset = int(explicit_offset)
+        if explicit_offset != normalized["sync_pilot"]["position_offset"]:
+            raise ValueError(
+                "Manifest pilot position_offset与payload配置不一致"
+            )
+    return normalized
 
 
 def _adaptive_alpha(
@@ -240,6 +376,30 @@ def issue_watermarked_pages(
         返回document、issue、payload、水印页面等结果。
         上层PDF/PPTX/DOCX Adapter负责把这些页面重新组成最终文件。
     """
+
+    key_id = validate_key_id(
+        key,
+        key_id,
+    )
+    watermark_config = build_watermark_config(
+        alpha=alpha,
+        repeat=repeat,
+        block_size=8,
+        pilot_bits=pilot_bits,
+        pilot_repeat=pilot_repeat,
+        pilot_alpha=pilot_alpha,
+        payload_flat_bright_scale=payload_flat_bright_scale,
+        pilot_flat_bright_scale=pilot_flat_bright_scale,
+    )
+    alpha = watermark_config["alpha"]
+    repeat = watermark_config["repeat"]
+    pilot_bits = watermark_config["sync_pilot"]["bit_count"]
+    pilot_repeat = watermark_config["sync_pilot"]["repeat"]
+    pilot_alpha = watermark_config["sync_pilot"]["alpha"]
+    payload_flat_bright_scale = watermark_config["flat_bright_scale"]
+    pilot_flat_bright_scale = watermark_config["sync_pilot"][
+        "flat_bright_scale"
+    ]
 
     source_path = Path(
         source_path
@@ -558,6 +718,9 @@ def issue_watermarked_pages(
 
         "manifest_pages":
             manifest_pages,
+
+        "watermark_config":
+            watermark_config,
 
         "issue_page_dir":
             issue_page_dir,
